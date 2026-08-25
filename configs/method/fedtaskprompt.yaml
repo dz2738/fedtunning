@@ -1,0 +1,50 @@
+name: fedtaskprompt
+
+num_basis: 8
+orthogonalize_basis: true
+projection_eps: 1.0e-6
+
+grouping:
+  fields: [op, in, out, dom, lang]
+  assignment_threshold: 0.65
+  create_new_group: true
+  freeze_during_normal_training: true
+
+coordinate_generator:
+  hidden_dim: 256
+  num_layers: 2
+  dropout: 0.0
+  output_activation: identity
+
+inner_loop:
+  steps: 1
+  coordinate_lr: 0.01
+  residual_lr: 0.001
+  coordinate_weight_decay: 1.0e-4
+  residual_weight_decay: 1.0e-4
+  project_residual: true
+  reset_residual_each_round: true
+  meta_gradient: coordinate_second_order
+
+server_optimizer:
+  name: adamw
+  lr: 1.0e-3
+  betas: [0.9, 0.999]
+  weight_decay: 1.0e-4
+  max_grad_norm: 1.0
+
+basis_maintenance:
+  enabled: true
+  interval: 20
+  residual_energy_threshold: 1.0
+  residual_clip_norm: 5.0
+  center_update_rate: 0.1
+  explained_energy_ratio: 0.9
+  max_replaced_basis: 2
+  usage_window: 20
+
+communication:
+  count_downloads: true
+  count_uploads: true
+  dtype_bytes: 4
+

@@ -1,0 +1,24 @@
+name: basis_drift
+num_rounds: 60
+client_fraction: 1.0
+min_clients_per_round: 1
+eval_every_rounds: 2
+
+drift:
+  enabled: true
+  round: 30
+  client_fraction: 0.4
+  type: task_swap
+
+variants:
+  - fixed_basis
+  - center_only
+  - directions_only
+  - full_maintenance
+
+track:
+  residual_energy: true
+  group_performance: true
+  negative_transfer_rate: true
+  maintenance_events: true
+

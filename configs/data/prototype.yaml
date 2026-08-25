@@ -1,0 +1,99 @@
+name: prototype
+cache_dir: .cache/huggingface
+streaming: false
+offline: false
+
+# Small caps keep the first end-to-end runs affordable. They can be overridden
+# without changing data code.
+max_train_examples_per_dataset: 600
+max_validation_examples_per_dataset: 150
+max_test_examples_per_dataset: 150
+
+clients_per_dataset: 2
+partition:
+  strategy: dirichlet
+  dirichlet_alpha: 0.5
+  min_examples_per_client: 24
+  size_imbalance: 0.0
+
+split:
+  support_ratio: 0.6
+  query_ratio: 0.2
+  test_ratio: 0.2
+
+tasks:
+  - task_id: sst2_sentiment
+    dataset_path: nyu-mll/glue
+    dataset_name: sst2
+    task_type: classification
+    input_fields: [sentence]
+    target_field: label
+    metric: accuracy
+    description:
+      op: sentiment_classification
+      in: sentence
+      out: categorical_label
+      dom: movie_review
+      lang: en
+
+  - task_id: ag_news_topic
+    dataset_path: fancyzhx/ag_news
+    dataset_name: null
+    task_type: classification
+    input_fields: [text]
+    target_field: label
+    metric: accuracy
+    description:
+      op: topic_classification
+      in: news_article
+      out: categorical_label
+      dom: news
+      lang: en
+
+  - task_id: conll2003_ner
+    dataset_path: tner/conll2003
+    dataset_name: null
+    task_type: sequence_labeling
+    input_fields: [tokens]
+    target_field: ner_tags
+    metric: seqeval_f1
+    description:
+      op: named_entity_extraction
+      in: token_sequence
+      out: labeled_spans
+      dom: news
+      lang: en
+
+  - task_id: squad_qa
+    dataset_path: rajpurkar/squad
+    dataset_name: null
+    task_type: question_answering
+    input_fields: [question, context]
+    target_field: answers
+    metric: squad_f1
+    description:
+      op: extractive_question_answering
+      in: question_and_context
+      out: answer_text
+      dom: general
+      lang: en
+
+  - task_id: xsum_summary
+    dataset_path: EdinburghNLP/xsum
+    dataset_name: null
+    task_type: summarization
+    input_fields: [document]
+    target_field: summary
+    metric: rouge_l
+    description:
+      op: abstractive_summarization
+      in: news_article
+      out: free_form_sequence
+      dom: news
+      lang: en
+
+text_template:
+  include_task_prefix: true
+  max_source_length: 384
+  max_target_length: 96
+

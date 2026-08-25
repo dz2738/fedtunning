@@ -1,0 +1,21 @@
+name: ablation
+num_rounds: 30
+client_fraction: 1.0
+min_clients_per_round: 1
+eval_every_rounds: 5
+
+variants:
+  - full
+  - single_group
+  - random_group
+  - zero_coordinate_init
+  - group_mean_init
+  - no_local_residual
+  - no_orthogonality
+  - private_only
+  - first_order
+  - full_second_order
+  - fixed_basis
+  - no_center_update
+  - no_direction_replacement
+

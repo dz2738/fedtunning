@@ -1,0 +1,33 @@
+defaults:
+  - data: prototype
+  - model: flan_t5_base
+  - method: fedtaskprompt
+  - experiment: main
+  - _self_
+
+seed: 42
+device: auto
+precision: bf16
+num_workers: 2
+deterministic: false
+
+output_dir: outputs/${experiment.name}/seed_${seed}
+
+logging:
+  level: INFO
+  log_every_rounds: 1
+  tensorboard: true
+  save_client_metrics: true
+
+checkpoint:
+  save_every_rounds: 10
+  keep_last: 2
+  resume_from: null
+
+hydra:
+  run:
+    dir: ${output_dir}
+  job:
+    chdir: false
+  output_subdir: hydra
+

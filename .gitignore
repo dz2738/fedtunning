@@ -1,0 +1,54 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Hugging Face and application caches
+.cache/
+huggingface_cache/
+
+# Training outputs
+outputs/
+checkpoints/
+runs/
+wandb/
+lightning_logs/
+*.log
+
+# Model weights
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+*.bin
+
+# Hydra
+.hydra/
+multirun/
+
+# IDE and operating system
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Temporary files
+*.tmp
+*.temp
+*.swp
+*~
+
+# Local environment variables and secrets
+.env
+.env.*
+!.env.example

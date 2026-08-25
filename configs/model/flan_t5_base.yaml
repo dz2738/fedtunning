@@ -1,0 +1,25 @@
+name: flan_t5_base
+pretrained_name_or_path: /root/autodl-tmp/models/flan-t5-base
+revision: main
+trust_remote_code: false
+local_files_only: true
+
+freeze_backbone: true
+dtype: bfloat16
+attention_implementation: eager
+gradient_checkpointing: false
+use_cache: false
+
+prompt:
+  length: 20
+  init: normal
+  init_std: 0.02
+
+task_encoder:
+  source: shared_encoder
+  pooling: masked_mean
+  embedding_dim: 256
+  projection_trainable: false
+  normalize: true
+  max_length: 128
+

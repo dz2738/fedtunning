@@ -19,7 +19,7 @@ class MetaGradientMode(StrEnum):
 
 @dataclass(frozen=True, slots=True)
 class InnerLoopConfig:
-    steps: int = 5
+    steps: int = 3
     support_batch_size: int = 4
     query_batch_size: int = 8
     coordinate_lr: float = 0.1

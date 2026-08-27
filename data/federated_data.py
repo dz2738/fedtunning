@@ -1,12 +1,21 @@
 """Build a memory-efficient, single-process federated data view."""
 
 from __future__ import annotations
-from pathlib import Path
-from huggingface_hub import hf_hub_download
+
 from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from itertools import islice
+from pathlib import Path
 from typing import Any
+
+from datasets import (
+    ClassLabel,
+    load_dataset,
+)
+from datasets import (
+    Sequence as HFSequence,
+)
+from huggingface_hub import hf_hub_download
 
 from data.partition import SplitRatios, build_client_partitions, partition_indices
 from data.preprocess import infer_label_names, preprocess_rows
@@ -17,16 +26,6 @@ from data.schema import (
     TaskSpec,
     TextExample,
     validate_unique_task_ids,
-)
-
-import os
-
-from collections.abc import Sequence
-
-from datasets import (
-    ClassLabel,
-    Sequence as HFSequence,
-    load_dataset,
 )
 
 CONLL2003_LABELS = [
@@ -47,6 +46,11 @@ def _load_conll2003(
     cache_dir: str | None,
     offline: bool,
 ):
+    """Load CoNLL-2003 from the tner JSON dump.
+
+    Sequence-labeling NER remains supported for optional experiments, but it is
+    not part of the default prototype mix.
+    """
     cache_root = Path(cache_dir or ".cache/huggingface")
     raw_dir = cache_root / "raw" / "tner_conll2003"
 
@@ -71,7 +75,7 @@ def _load_conll2003(
             raise FileNotFoundError(
                 "CoNLL2003 本地原始文件不存在。"
                 "请先在联网模式下运行一次 prepare_data.py。"
-                f" 缺少文件：{missing}"
+                f" 缺少文件: {missing}"
             )
     else:
         data_files = {
@@ -154,6 +158,10 @@ class ClientData:
         return self.split(DataSplit.QUERY)
 
     @property
+    def validation(self) -> ClientDatasetView:
+        return self.split(DataSplit.VALIDATION)
+
+    @property
     def test(self) -> ClientDatasetView:
         return self.split(DataSplit.TEST)
 
@@ -193,6 +201,7 @@ def _load_task_rows(
     streaming: bool,
     offline: bool,
     max_examples: int,
+    row_offset: int,
 ) -> tuple[Any, Sequence[Mapping[str, Any]]]:
     
     try:
@@ -215,11 +224,17 @@ def _load_task_rows(
             streaming=streaming,
             download_config=download_config,
         )
+    if row_offset < 0:
+        raise ValueError("row_offset must be non-negative")
     if streaming:
-        rows = tuple(islice(dataset, max_examples))
+        rows = tuple(islice(dataset, row_offset, row_offset + max_examples))
     else:
-        count = min(len(dataset), max_examples)
-        rows = dataset.select(range(count))
+        stop = min(len(dataset), row_offset + max_examples)
+        if row_offset >= stop:
+            raise ValueError(
+                f"row_offset={row_offset} leaves no rows in task {spec.task_id!r}"
+            )
+        rows = dataset.select(range(row_offset, stop))
     return dataset, rows
 
 
@@ -240,6 +255,7 @@ def build_federated_data(
     ratios = SplitRatios(
         support=float(split_config["support_ratio"]),
         query=float(split_config["query_ratio"]),
+        validation=float(split_config["validation_ratio"]),
         test=float(split_config["test_ratio"]),
     )
     partition_config = config["partition"]
@@ -263,6 +279,7 @@ def build_federated_data(
             streaming=bool(config.get("streaming", False)),
             offline=bool(config.get("offline", False)),
             max_examples=max_examples,
+            row_offset=int(config.get("row_offset", 0)),
         )
         label_names = infer_label_names(raw_dataset, spec.target_field)
         examples = preprocess_rows(
@@ -272,6 +289,7 @@ def build_federated_data(
             label_names=label_names,
             include_task_prefix=bool(template_config.get("include_task_prefix", True)),
             max_examples=max_examples,
+            row_index_offset=int(config.get("row_offset", 0)),
         )
         task_seed = seed + task_number * 10_000
         client_indices = partition_indices(

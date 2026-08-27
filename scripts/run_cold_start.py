@@ -11,6 +11,7 @@ import hydra
 import numpy as np
 from omegaconf import DictConfig
 
+from data.schema import DataSplit
 from trainer.simulator import FederatedSimulator, SimulationConfig
 
 try:
@@ -67,6 +68,7 @@ def main(config: DictConfig) -> None:
             client_ids=holdout_ids,
             adaptation_steps=int(steps),
             seed=int(config.seed),
+            split=DataSplit.TEST,
         )
         for steps in config.experiment.adaptation_steps
     ]

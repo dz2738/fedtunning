@@ -11,7 +11,6 @@ from omegaconf import DictConfig, OmegaConf
 
 from data.federated_data import build_federated_data
 
-
 LOGGER = logging.getLogger(__name__)
 
 
@@ -30,6 +29,7 @@ def main(config: DictConfig) -> None:
                 "task_id": client.task.task_id,
                 "support": len(client.support),
                 "query": len(client.query),
+                "validation": len(client.validation),
                 "test": len(client.test),
             }
             for client_id, client in sorted(data.clients.items())

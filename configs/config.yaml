@@ -1,17 +1,19 @@
 defaults:
   - data: prototype
+  - public_data: prototype_proxy
   - model: flan_t5_base
   - method: fedtaskprompt
   - experiment: main
   - _self_
 
 seed: 42
+run_id: ${now:%Y%m%d_%H%M%S}
 device: auto
 precision: bf16
 num_workers: 2
 deterministic: false
 
-output_dir: outputs/${experiment.name}/seed_${seed}
+output_dir: outputs/${experiment.name}/seed_${seed}/${run_id}
 
 logging:
   level: INFO

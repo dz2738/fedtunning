@@ -2,15 +2,18 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from enum import StrEnum
-from typing import Any, Mapping, Sequence
+from typing import Any
 
 
 class TaskType(StrEnum):
     """Task families supported by the first prototype."""
 
     CLASSIFICATION = "classification"
+    NATURAL_LANGUAGE_INFERENCE = "natural_language_inference"
+    BOOLEAN_QA = "boolean_qa"
     SEQUENCE_LABELING = "sequence_labeling"
     QUESTION_ANSWERING = "question_answering"
     SUMMARIZATION = "summarization"
@@ -19,6 +22,7 @@ class TaskType(StrEnum):
 class DataSplit(StrEnum):
     SUPPORT = "support"
     QUERY = "query"
+    VALIDATION = "validation"
     TEST = "test"
 
 
@@ -141,6 +145,7 @@ class ClientPartition:
     task_id: str
     support_indices: tuple[int, ...]
     query_indices: tuple[int, ...]
+    validation_indices: tuple[int, ...]
     test_indices: tuple[int, ...]
 
     def __post_init__(self) -> None:
@@ -149,17 +154,17 @@ class ClientPartition:
         split_sets = {
             DataSplit.SUPPORT: set(self.support_indices),
             DataSplit.QUERY: set(self.query_indices),
+            DataSplit.VALIDATION: set(self.validation_indices),
             DataSplit.TEST: set(self.test_indices),
         }
         for split_name, indices in split_sets.items():
             if len(indices) != len(self.indices(split_name)):
                 raise ValueError(f"{split_name} contains duplicate indices")
-        if split_sets[DataSplit.SUPPORT] & split_sets[DataSplit.QUERY]:
-            raise ValueError("support and query indices overlap")
-        if split_sets[DataSplit.SUPPORT] & split_sets[DataSplit.TEST]:
-            raise ValueError("support and test indices overlap")
-        if split_sets[DataSplit.QUERY] & split_sets[DataSplit.TEST]:
-            raise ValueError("query and test indices overlap")
+        splits = tuple(split_sets)
+        for index, left in enumerate(splits):
+            for right in splits[index + 1 :]:
+                if split_sets[left] & split_sets[right]:
+                    raise ValueError(f"{left} and {right} indices overlap")
 
     def indices(self, split: DataSplit | str) -> tuple[int, ...]:
         split = DataSplit(split)
@@ -167,11 +172,18 @@ class ClientPartition:
             return self.support_indices
         if split is DataSplit.QUERY:
             return self.query_indices
+        if split is DataSplit.VALIDATION:
+            return self.validation_indices
         return self.test_indices
 
     @property
     def num_examples(self) -> int:
-        return len(self.support_indices) + len(self.query_indices) + len(self.test_indices)
+        return (
+            len(self.support_indices)
+            + len(self.query_indices)
+            + len(self.validation_indices)
+            + len(self.test_indices)
+        )
 
 
 def validate_unique_task_ids(specs: Sequence[TaskSpec]) -> None:

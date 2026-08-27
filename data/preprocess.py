@@ -66,11 +66,14 @@ def preprocess_rows(
     label_names: Sequence[str] | None = None,
     include_task_prefix: bool = True,
     max_examples: int | None = None,
+    row_index_offset: int = 0,
 ) -> tuple[TextExample, ...]:
     """Materialize a bounded collection of normalized examples."""
 
     if max_examples is not None and max_examples <= 0:
         raise ValueError("max_examples must be positive or None")
+    if row_index_offset < 0:
+        raise ValueError("row_index_offset must be non-negative")
     registry = registry or build_default_registry()
     examples: list[TextExample] = []
     for row_index, row in enumerate(rows):
@@ -79,7 +82,7 @@ def preprocess_rows(
         examples.append(
             normalize_row(
                 row,
-                row_index=row_index,
+                row_index=row_index + row_index_offset,
                 spec=spec,
                 registry=registry,
                 label_names=label_names,

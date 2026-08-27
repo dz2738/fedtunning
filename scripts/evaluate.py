@@ -10,6 +10,7 @@ from pathlib import Path
 import hydra
 from omegaconf import DictConfig
 
+from data.schema import DataSplit
 from trainer.checkpoint import load_checkpoint
 
 try:
@@ -41,6 +42,7 @@ def main(config: DictConfig) -> None:
             clients=runtime.clients,
             adaptation_steps=adaptation_steps,
             seed=int(config.seed),
+            split=DataSplit.TEST,
         )
         for adaptation_steps in steps
     ]

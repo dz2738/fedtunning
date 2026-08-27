@@ -1,4 +1,4 @@
-"""Deterministic client partitioning and support/query/test splitting."""
+"""Deterministic client partitioning and support/query/validation/test splitting."""
 
 from __future__ import annotations
 
@@ -14,10 +14,11 @@ from data.schema import ClientPartition
 class SplitRatios:
     support: float
     query: float
+    validation: float
     test: float
 
     def __post_init__(self) -> None:
-        values = (self.support, self.query, self.test)
+        values = (self.support, self.query, self.validation, self.test)
         if any(value <= 0 for value in values):
             raise ValueError("all split ratios must be positive")
         if not np.isclose(sum(values), 1.0):
@@ -159,15 +160,16 @@ def split_client_indices(
     ratios: SplitRatios,
     *,
     seed: int,
-) -> tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...]]:
-    if len(indices) < 3:
-        raise ValueError("each client needs at least three examples")
+) -> tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...], tuple[int, ...]]:
+    if len(indices) < 4:
+        raise ValueError("each client needs at least four examples")
     rng = np.random.default_rng(seed)
     shuffled = np.asarray(indices, dtype=np.int64).copy()
     rng.shuffle(shuffled)
 
     raw_counts = np.asarray(
-        [ratios.support, ratios.query, ratios.test], dtype=np.float64
+        [ratios.support, ratios.query, ratios.validation, ratios.test],
+        dtype=np.float64,
     ) * len(shuffled)
     counts = np.floor(raw_counts).astype(int)
     counts = np.maximum(counts, 1)
@@ -182,10 +184,12 @@ def split_client_indices(
 
     support_end = int(counts[0])
     query_end = support_end + int(counts[1])
+    validation_end = query_end + int(counts[2])
     return (
         tuple(sorted(shuffled[:support_end].tolist())),
         tuple(sorted(shuffled[support_end:query_end].tolist())),
-        tuple(sorted(shuffled[query_end:].tolist())),
+        tuple(sorted(shuffled[query_end:validation_end].tolist())),
+        tuple(sorted(shuffled[validation_end:].tolist())),
     )
 
 
@@ -198,7 +202,7 @@ def build_client_partitions(
 ) -> tuple[ClientPartition, ...]:
     partitions: list[ClientPartition] = []
     for client_number, task_indices in enumerate(task_indices_by_client):
-        support, query, test = split_client_indices(
+        support, query, validation, test = split_client_indices(
             task_indices,
             ratios,
             seed=seed + client_number,
@@ -209,6 +213,7 @@ def build_client_partitions(
                 task_id=task_id,
                 support_indices=support,
                 query_indices=query,
+                validation_indices=validation,
                 test_indices=test,
             )
         )

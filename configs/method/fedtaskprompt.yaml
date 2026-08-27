@@ -1,12 +1,14 @@
 name: fedtaskprompt
 
-num_basis: 8
+num_basis: 4
 orthogonalize_basis: true
 projection_eps: 1.0e-6
 
 grouping:
-  fields: [op, in, out, dom, lang]
-  assignment_threshold: 0.65
+  similarity: cosine
+  strategy: agglomerative
+  assignment_threshold: 0.95
+  centroid_eps: 1.0e-12
   create_new_group: true
   freeze_during_normal_training: true
 
@@ -16,35 +18,63 @@ coordinate_generator:
   dropout: 0.0
   output_activation: identity
 
+public_initialization:
+  enabled: false
+  checkpoint_path: artifacts/public_initialization.pt
+  require_checkpoint: false
+  center_steps: 200
+  center_lr: 0.01
+  task_steps: 100
+  task_lr: 0.01
+  generator_steps: 500
+  generator_lr: 0.001
+  max_examples_per_task: 128
+  batch_size: 8
+
 inner_loop:
-  steps: 1
-  coordinate_lr: 0.01
-  residual_lr: 0.001
+  steps: 5
+  support_batch_size: 4
+  query_batch_size: 8
+  coordinate_lr: 0.001
+  residual_lr: 0.002
   coordinate_weight_decay: 1.0e-4
   residual_weight_decay: 1.0e-4
   project_residual: true
   reset_residual_each_round: true
   meta_gradient: coordinate_second_order
+  # Truncate the coordinate-Hessian reverse recursion while keeping all 5 forward steps.
+  second_order_steps: 1
+  # Tikhonov shift: H_cc v -> (H_cc + lambda I) v; 0 preserves the paper formula.
+  hessian_damping: 0.0
 
 server_optimizer:
   name: adamw
-  lr: 1.0e-3
+  lr: 3.0e-4
   betas: [0.9, 0.999]
   weight_decay: 1.0e-4
   max_grad_norm: 1.0
+  feedback_max_norm: 1.0
+  warmup_rounds: 5
+  decay_rate: 0.98
+  min_lr_ratio: 0.1
+  coordinate_regularization: 1.0e-4
+  group_weighting: uniform
+  client_weighting: query_examples
 
 basis_maintenance:
   enabled: true
-  interval: 20
-  residual_energy_threshold: 1.0
+  interval: 10
+  energy_mode: relative
+  residual_energy_threshold: 0.1
   residual_clip_norm: 5.0
   center_update_rate: 0.1
   explained_energy_ratio: 0.9
-  max_replaced_basis: 2
+  max_replaced_basis: 1
   usage_window: 20
+  orthogonality_tolerance: 1.0e-5
+  numerical_reorthogonalize: true
 
 communication:
   count_downloads: true
   count_uploads: true
   dtype_bytes: 4
-

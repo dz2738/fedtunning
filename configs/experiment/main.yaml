@@ -4,6 +4,7 @@ client_fraction: 1.0
 min_clients_per_round: 1
 eval_every_rounds: 5
 eval_inner_steps: [0, 1, 3, 5]
+selection_adaptation_steps: 5
 
 baselines:
   - local_prompt

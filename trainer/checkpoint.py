@@ -15,7 +15,6 @@ import torch
 from client.client import FederatedClient
 from server.server import FedTaskPromptServer
 
-
 CHECKPOINT_FORMAT_VERSION = 1
 
 
@@ -31,9 +30,11 @@ def capture_rng_state() -> dict[str, Any]:
 def restore_rng_state(state: Mapping[str, Any]) -> None:
     random.setstate(state["python"])
     np.random.set_state(state["numpy"])
-    torch.set_rng_state(state["torch_cpu"])
+    torch.set_rng_state(state["torch_cpu"].cpu())
     if torch.cuda.is_available() and state.get("torch_cuda") is not None:
-        torch.cuda.set_rng_state_all(state["torch_cuda"])
+        torch.cuda.set_rng_state_all(
+            [device_state.cpu() for device_state in state["torch_cuda"]]
+        )
 
 
 def _client_state(clients: Mapping[str, FederatedClient]) -> dict[str, dict[str, Any]]:

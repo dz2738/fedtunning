@@ -40,6 +40,27 @@ def test_frozen_grouping_does_not_reroute_existing_client() -> None:
     assert not decision.created
 
 
+def test_agglomerative_grouping_is_stable_and_uses_task_items_once() -> None:
+    config = GroupingConfig(
+        strategy="agglomerative",
+        assignment_threshold=0.9,
+    )
+    embeddings = {
+        "task_b": torch.tensor([0.0, 1.0]),
+        "task_a2": torch.tensor([0.98, 0.08]),
+        "task_a1": torch.tensor([1.0, 0.0]),
+    }
+
+    first = SemanticGrouper(config)
+    second = SemanticGrouper(config)
+    first_assignments = first.fit(embeddings)
+    second_assignments = second.fit(dict(reversed(tuple(embeddings.items()))))
+
+    assert first_assignments == second_assignments
+    assert first_assignments["task_a1"] == first_assignments["task_a2"]
+    assert first_assignments["task_a1"] != first_assignments["task_b"]
+
+
 def test_removed_discrete_grouping_config_is_rejected() -> None:
     try:
         GroupingConfig.from_mapping(

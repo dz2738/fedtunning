@@ -1,27 +1,29 @@
-name: prototype
+name: prototype_proxy
 cache_dir: .cache/huggingface
 streaming: false
 offline: false
-row_offset: 0
 
-# Small caps keep the first end-to-end runs affordable. They can be overridden
-# without changing data code.
-max_train_examples_per_dataset: 600
-max_validation_examples_per_dataset: 150
-max_test_examples_per_dataset: 150
+# The private prototype consumes rows [0, 900). Public proxy examples start
+# afterwards, so public initialization cannot read any client split.
+row_offset: 900
+max_train_examples_per_dataset: 128
+max_validation_examples_per_dataset: 0
+max_test_examples_per_dataset: 0
 
-clients_per_dataset: 2
+clients_per_dataset: 1
 partition:
   strategy: dirichlet
   dirichlet_alpha: 0.5
-  min_examples_per_client: 24
+  min_examples_per_client: 4
   size_imbalance: 0.0
 
+# These splits only satisfy the shared data container contract. The public
+# initializer consumes the complete, disjoint public collection.
 split:
-  support_ratio: 0.5
-  query_ratio: 0.2
-  validation_ratio: 0.1
-  test_ratio: 0.2
+  support_ratio: 0.25
+  query_ratio: 0.25
+  validation_ratio: 0.25
+  test_ratio: 0.25
 
 tasks:
   - task_id: sst2_sentiment
@@ -52,9 +54,6 @@ tasks:
       dom: news
       lang: en
 
-  # Sequence-labeling NER is still implemented, but CoNLL-2003 is not in the
-  # default mix: BIO tags are rewritten as "TYPE: span" strings, and a 20-token
-  # frozen-backbone prompt cannot learn that format in 5 inner steps (F1 stayed 0).
   - task_id: glue_rte
     dataset_path: nyu-mll/glue
     dataset_name: rte
@@ -115,4 +114,3 @@ text_template:
   include_task_prefix: true
   max_source_length: 384
   max_target_length: 96
-

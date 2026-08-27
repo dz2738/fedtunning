@@ -22,7 +22,7 @@ backbone，所有客户端在同一 Python 进程中顺序复用该模型。两�
 | 经验迁移矩阵 | 已接通 | 使用 Local Prompt 构造两两迁移增益 |
 | 部分消融实验 | 已接通 | 仅运行能够被当前配置严格表达的消融 |
 | 五种基线算法类 | 已实现，未接入统一训练入口 | 暂不能直接生成完整基线对比表 |
-| Accuracy、F1、ROUGE 等生成指标 | 指标函数已实现，未接入 evaluator | 当前统一训练入口主要输出 test loss |
+| Accuracy、F1、ROUGE 等生成指标 | 已接入 evaluator | validation 与最终 test 均执行生成并按任务汇总 |
 | 通信量与运行效率统计 | 统计组件已实现，未接入 simulator 日志 | 当前训练输出不包含完整效率汇总 |
 | basis drift 任务交换 | 只有配置，尚未接入 simulator | 不能用于正式漂移实验结论 |
 
@@ -110,6 +110,7 @@ configs/config.yaml
 
 ```text
 configs/data/prototype.yaml
+configs/public_data/prototype_proxy.yaml
 configs/model/flan_t5_base.yaml
 configs/method/fedtaskprompt.yaml
 configs/experiment/main.yaml
@@ -119,12 +120,15 @@ configs/experiment/main.yaml
 
 - backbone：`google/flan-t5-base`；
 - Prompt 长度：20；
-- 共享 basis 数量：8；
-- 语义分组：任务向量余弦相似度，阈值 0.65；
+- 共享 basis 数量：4；
+- 语义分组：任务级、顺序无关的凝聚聚类，余弦阈值 0.95；
 - 本地适应步数：5；
-- 元梯度：`coordinate_second_order`；
+- 元梯度：`coordinate_second_order`，保留最后 1 个坐标二阶反向步；
 - 全局坐标生成器：唯一实例；
-- basis 维护周期：20 轮；
+- 本地学习率：坐标 0.001、正交残差 0.002；
+- 服务器学习率：`3e-4`，前 5 轮 warmup，之后按 0.98 衰减；
+- 客户端坐标反馈范数上限：1.0；
+- basis 维护周期：10 轮，按相对残差能量 0.1 触发。
 - 主实验轮数：50。
 
 命令行中的 Hydra 覆盖只改变本次实验，不会修改 YAML 文件。例如：
@@ -166,24 +170,40 @@ uv run pytest -q tests/test_smoke_train.py
 
 ## 6. 准备数据
 
-默认原型包含情感分类、主题分类、实体抽取、问答和摘要任务。
+默认原型包含 6 个任务、每个数据集 2 个客户端（共 12 个客户端）：
+
+- SST-2 情感分类（Accuracy）
+- AG News 主题分类（Accuracy）
+- GLUE RTE 文本蕴含（Accuracy）
+- BoolQ 是否问答（Accuracy）
+- SQuAD 抽取式问答（Token F1）
+- XSum 摘要（ROUGE-L）
+
+CoNLL-2003 序列标注已从默认配置中移除。该任务被改写成 `"PER: Alice ; LOC: Paris"` 生成，
+评测再用分号解析做 span micro-F1。金标对金标为 1.0，但自由文本或 `"none"` 预测对实体金标为 0。
+主实验 50 轮中 CoNLL 的 token loss 一直停在约 2.9–3.3，F1 始终为 0，说明 20 token 冻结
+backbone 上的 soft prompt 加 5 步内循环学不会这种结构化 span 格式。适配器仍保留，
+需要时可把 `sequence_labeling` 任务加回 YAML。
+
+更换任务集合后必须重新运行 `prepare_public_init.py`，旧的 `public_initialization.pt`
+不能与新任务描述或新的客户端集合混用。
 
 ```bash
-CUDA_VISIBLE_DEVICES=0 uv run python scripts/prepare_data.py data=prototype seed=42
+HF_ENDPOINT=https://hf-mirror.com CUDA_VISIBLE_DEVICES=0 uv run python scripts/prepare_data.py data=prototype seed=42
 ```
 
 该命令会下载或读取缓存数据，完成统一 text-to-text 预处理、客户端划分以及
-support/query/test 划分，并生成：
+support/query/validation/test 四分割，并生成：
 
 ```text
-outputs/main/seed_42/data_manifest.json
+outputs/main/seed_42/<run_id>/data_manifest.json
 ```
 
 检查 manifest 中以下字段：
 
 - `num_tasks` 是否等于预期任务数；
 - `num_clients` 是否等于任务数乘以每个数据集的客户端数；
-- 每个客户端的 support、query 和 test 是否均非空；
+- 每个客户端的 support、query、validation 和 test 是否均非空；
 - 不同实验是否使用相同 seed 和配置。
 
 ### 6.1 离线运行
@@ -197,6 +217,38 @@ CUDA_VISIBLE_DEVICES=0 uv run python scripts/prepare_data.py \
 ```
 
 如果缓存不完整，该命令会失败，而不会自动从网络补齐。
+若 `huggingface.co` 不可达，下载新数据集时可设置 `HF_ENDPOINT=https://hf-mirror.com`。
+
+### 6.2 准备隔离的公共初始化
+
+公共初始化必须使用 `configs/public_data/prototype_proxy.yaml`。原型配置读取每个数据集
+从第 900 行开始的 128 条样本，而客户端数据只读取前 900 行，因此两者不会共享样本。
+
+```bash
+RUN_ID="public_init_seed42_$(date +%Y%m%d_%H%M%S)"
+HF_HUB_OFFLINE=1 HF_DATASETS_OFFLINE=1 TOKENIZERS_PARALLELISM=false \
+CUDA_VISIBLE_DEVICES=0 \
+uv run python scripts/prepare_public_init.py \
+  public_data=prototype_proxy \
+  seed=42 \
+  run_id="$RUN_ID" \
+  device=cuda:0 \
+  data.offline=true \
+  public_data.offline=true \
+  model.local_files_only=true \
+  method.num_basis=4 \
+  method.public_initialization.checkpoint_path=artifacts/public_initialization.pt \
+  output_dir="outputs/public_init/seed_42/$RUN_ID"
+```
+
+该命令生成：
+
+```text
+artifacts/public_initialization.pt
+artifacts/public_initialization.manifest.json
+```
+
+manifest 保存公共配置和全部公共样本 ID，用于审计公共/私有数据隔离。
 
 ## 7. 先运行最小真实模型实验
 
@@ -214,20 +266,30 @@ CUDA_VISIBLE_DEVICES=0 uv run python scripts/train.py \
   experiment.num_rounds=2 \
   experiment.eval_every_rounds=1 \
   experiment.eval_inner_steps='[0,1]' \
+  experiment.selection_adaptation_steps=1 \
   method.inner_loop.steps=1 \
+  method.public_initialization.enabled=true \
+  method.public_initialization.require_checkpoint=true \
   checkpoint.save_every_rounds=1
 ```
 
 完成后检查：
 
 ```text
-outputs/main/seed_42/
+outputs/main/seed_42/<run_id>/
+├── run_metadata.json
 ├── resolved_config.yaml
+├── grouping_report.json
 ├── rounds.jsonl
+├── client_adaptation.jsonl
 ├── evaluations.jsonl
+├── best_validation.json
+├── test_evaluation.json
+├── tensorboard/
 └── checkpoints/
     ├── round_000001.pt
     ├── round_000002.pt
+    ├── best.pt
     └── final.pt
 ```
 
@@ -236,38 +298,113 @@ outputs/main/seed_42/
 1. `rounds.jsonl` 中轮数连续；
 2. `active_groups` 非空；
 3. `mean_support_loss` 和 `mean_query_loss` 为有限值；
-4. `gradient_norm` 不是持续为零或 NaN；
+4. `gradient_norm`、`gradient_norm_after_clip`、`feedback_norm_max` 和
+   `learning_rate` 均为有限值，并检查反馈/梯度裁剪是否长期饱和；
 5. `evaluations.jsonl` 同时包含 0 步和 1 步适应结果；
 6. 显存不会随客户端数量持续线性增长。
 
+`evaluations.jsonl` 只记录训练期 validation。训练结束后，程序加载 validation 最优
+checkpoint，并且只执行一次最终 test，结果写入 `test_evaluation.json`。每次运行使用时间戳
+`run_id` 创建独立目录；非恢复训练拒绝向已有结果目录追加日志。
+
+`grouping_report.json` 保存任务级余弦相似度矩阵、凝聚聚类阈值、任务分组及其客户端成员。
+聚类只让每个任务参与一次，避免同任务客户端数量影响语义质心。
+
 ## 8. 运行主实验
 
-完成最小试跑后，运行默认主实验：
+项目不再保留只封装 Hydra 参数的 shell 启动脚本。正式 50 轮实验使用以下完整命令：
 
 ```bash
+RUN_ID="main_seed42_$(date +%Y%m%d_%H%M%S)"
+HF_HUB_OFFLINE=1 HF_DATASETS_OFFLINE=1 TOKENIZERS_PARALLELISM=false \
 CUDA_VISIBLE_DEVICES=0 uv run python scripts/train.py \
   experiment=main \
   seed=42 \
-  device=cuda:0
-```
-
-为了提高可复现性，正式实验建议启用：
-
-```bash
-deterministic=true
-```
-
-完整命令为：
-
-```bash
-CUDA_VISIBLE_DEVICES=0 uv run python scripts/train.py \
-  experiment=main \
-  seed=42 \
+  run_id="$RUN_ID" \
   device=cuda:0 \
-  deterministic=true
+  deterministic=true \
+  data.offline=true \
+  model.local_files_only=true \
+  method.num_basis=4 \
+  method.inner_loop.meta_gradient=coordinate_second_order \
+  method.inner_loop.coordinate_lr=0.001 \
+  method.inner_loop.second_order_steps=1 \
+  method.inner_loop.hessian_damping=0.0 \
+  method.public_initialization.enabled=true \
+  method.public_initialization.require_checkpoint=true \
+  method.public_initialization.checkpoint_path=artifacts/public_initialization.pt \
+  experiment.num_rounds=50 \
+  experiment.eval_every_rounds=5 \
+  experiment.eval_inner_steps='[0,5]' \
+  experiment.selection_adaptation_steps=5 \
+  checkpoint.save_every_rounds=5 \
+  checkpoint.keep_last=2
+```
+
+正式实验前建议先运行下列 10 轮中等规模验证。它使用 12 个客户端，并在第 10 轮检查
+basis 维护：
+
+```bash
+RUN_ID="validation_seed42_$(date +%Y%m%d_%H%M%S)"
+HF_HUB_OFFLINE=1 HF_DATASETS_OFFLINE=1 TOKENIZERS_PARALLELISM=false \
+CUDA_VISIBLE_DEVICES=0 uv run python scripts/train.py \
+  experiment=main \
+  seed=42 \
+  run_id="$RUN_ID" \
+  device=cuda:0 \
+  deterministic=true \
+  data.offline=true \
+  model.local_files_only=true \
+  data.max_train_examples_per_dataset=200 \
+  data.max_validation_examples_per_dataset=0 \
+  data.max_test_examples_per_dataset=0 \
+  data.clients_per_dataset=2 \
+  data.partition.min_examples_per_client=40 \
+  method.num_basis=4 \
+  method.inner_loop.coordinate_lr=0.001 \
+  method.inner_loop.second_order_steps=1 \
+  method.inner_loop.hessian_damping=0.0 \
+  method.public_initialization.enabled=true \
+  method.public_initialization.require_checkpoint=true \
+  method.public_initialization.checkpoint_path=artifacts/public_initialization.pt \
+  experiment.num_rounds=10 \
+  experiment.eval_every_rounds=2 \
+  experiment.eval_inner_steps='[0,5]' \
+  experiment.selection_adaptation_steps=5 \
+  checkpoint.save_every_rounds=2 \
+  checkpoint.keep_last=2
 ```
 
 确定性计算可能降低速度，并且部分算子只能给出警告。应在实验记录中注明是否启用。
+
+### 8.1 可视化客户端微调损失
+
+每轮训练会生成两类客户端微调记录：
+
+- `client_adaptation.jsonl`：保存轮次、客户端 ID、每步训练 mini-batch loss、固定 support
+  监控批次在更新前后的 loss，以及终端 query loss；
+- `tensorboard/`：保存可直接交互查看的 TensorBoard 标量。
+
+启动可视化：
+
+```bash
+uv run tensorboard \
+  --logdir "outputs/main/seed_42/main_seed42_20260828_010922/tensorboard" \
+  --port 6006 \
+  --bind_all
+```
+
+浏览器打开终端给出的地址，在 Scalars 中查看
+
+- `client_finetune/fixed_support_loss/*`：判断微调是否有效的主曲线。每轮包含 step 0
+  （更新前）和每次更新后的 loss，共 `inner_loop.steps + 1` 个点，而且始终使用同一批样本；
+- `client_finetune/train_batch_loss/*`：实际参与梯度更新的 mini-batch loss，不同步骤可能
+  使用不同样本，只用于排查训练数值；
+- `client_finetune/query_loss/*`：每轮本地适应完成后的 query loss，每个客户端每轮一个点。
+
+TensorBoard 的 Smoothing 建议先设为 0。固定 support 曲线的横轴将“轮次 ×
+（本地步数 + 1）”展开；判断单轮微调效果时，比较该轮 step 0 和最后一个点，而不是比较
+`train_batch_loss` 中来自不同 mini-batch 的相邻点。
 
 ## 9. 从 checkpoint 恢复训练
 
@@ -281,8 +418,12 @@ CUDA_VISIBLE_DEVICES=0 uv run python scripts/train.py \
   seed=42 \
   device=cuda:0 \
   experiment.num_rounds=50 \
+  output_dir=/absolute/path/to/original/run \
   checkpoint.resume_from=/absolute/path/to/round_000020.pt
 ```
+
+要继续向原运行的 JSONL 追加记录，必须同时把 `output_dir` 指向该运行目录；程序会拒绝把
+其他运行目录中的 checkpoint 追加到一个已有结果目录。
 
 恢复时必须保持以下项目一致：
 
@@ -314,7 +455,7 @@ experiment.eval_inner_steps='[0,1,3,5,10]'
 输出文件为：
 
 ```text
-outputs/main/seed_42/standalone_evaluation.json
+outputs/main/seed_42/<run_id>/standalone_evaluation.json
 ```
 
 当前 evaluator 输出：
@@ -322,7 +463,8 @@ outputs/main/seed_42/standalone_evaluation.json
 - 加权平均 test loss；
 - 客户端 test loss 标准差；
 - 最差客户端分位 test loss；
-- 每个客户端的 test loss 和残差能量。
+- 每个客户端的 test loss 和残差能量；
+- 分类 / 蕴含 / 是否问答 Accuracy、问答 Token F1、摘要 ROUGE-L。
 
 ## 11. 运行冷启动实验
 
@@ -361,7 +503,7 @@ CUDA_VISIBLE_DEVICES=0 uv run python scripts/build_transfer_matrix.py \
 输出：
 
 ```text
-outputs/main/seed_42/transfer_matrix.json
+outputs/main/seed_42/<run_id>/transfer_matrix.json
 ```
 
 矩阵元素定义为：
@@ -450,7 +592,7 @@ uv run python scripts/launch_sweep.py \
 
 ### 15.2 当前脚本可直接整理的内容
 
-在当前 loss 级别实验中，可以直接从现有输出整理：
+可以直接从现有输出整理：
 
 - 平均 test loss；
 - 客户端间标准差；
@@ -460,6 +602,8 @@ uv run python scripts/launch_sweep.py \
 - 生成器梯度范数；
 - 残差能量；
 - basis 维护事件与触发次数。
+- validation 选择的最优 checkpoint；
+- 各任务在最终 test 上的 Accuracy、Token F1 或 ROUGE-L。
 
 以下内容虽然已有独立统计组件，但尚未接入主训练日志：
 
@@ -474,8 +618,11 @@ uv run python scripts/launch_sweep.py \
 
 ### 15.3 任务原始指标
 
-`metrics/task_metrics.py` 已提供 Accuracy、Exact Match、Token F1、Span F1 和 ROUGE-L，
-但当前 evaluator 尚未调用模型生成并计算这些指标。接通生成评测前，论文中不要声称当前脚本已经输出这些任务指标。
+`metrics/task_metrics.py` 提供 Accuracy、Exact Match、Token F1、Span F1 和 ROUGE-L。
+默认原型不再使用 Span F1；该指标仍服务于可选的序列标注任务。
+`FederatedClient.evaluate_loss()` 在完成支持集适应后调用模型生成，`FederatedEvaluator`
+按任务和样本数汇总原始指标。训练期指标来自 validation；`test_evaluation.json` 只报告
+validation 所选 checkpoint 的最终 test 指标。
 
 ## 16. 可复现性检查清单
 
@@ -543,6 +690,62 @@ model.dtype=float32
 
 这是预期现象。`full_second_order` 只应用于小规模正确性与代价对照。主实验优先使用
 `coordinate_second_order`，资源紧张时使用 `first_order`。
+
+`coordinate_second_order` 默认保留 5 步前向本地适应，但只反向传播最后 1 个
+坐标 Hessian 步，以避开更早步骤观测到的强负曲率放大。以下完整命令可复现关键候选扫描：
+
+```bash
+for SPEC in \
+  "0.001 1 0.0" \
+  "0.001 null 0.0" \
+  "0.01 1 0.0" \
+  "0.002 null 100.0"
+do
+  read -r COORDINATE_LR SECOND_ORDER_STEPS HESSIAN_DAMPING <<< "$SPEC"
+  RUN_ID="meta_lr${COORDINATE_LR}_k${SECOND_ORDER_STEPS}_d${HESSIAN_DAMPING}_$(date +%Y%m%d_%H%M%S)"
+  HF_HUB_OFFLINE=1 HF_DATASETS_OFFLINE=1 TOKENIZERS_PARALLELISM=false \
+  CUDA_VISIBLE_DEVICES=0 uv run python scripts/train.py \
+    experiment=main \
+    seed=42 \
+    run_id="$RUN_ID" \
+    device=cuda:0 \
+    deterministic=true \
+    data.offline=true \
+    model.local_files_only=true \
+    data.max_train_examples_per_dataset=20 \
+    data.max_validation_examples_per_dataset=0 \
+    data.max_test_examples_per_dataset=0 \
+    data.clients_per_dataset=1 \
+    data.partition.min_examples_per_client=4 \
+    method.num_basis=4 \
+    method.inner_loop.steps=5 \
+    method.inner_loop.coordinate_lr="$COORDINATE_LR" \
+    method.inner_loop.second_order_steps="$SECOND_ORDER_STEPS" \
+    method.inner_loop.hessian_damping="$HESSIAN_DAMPING" \
+    method.inner_loop.support_batch_size=2 \
+    method.inner_loop.query_batch_size=4 \
+    method.inner_loop.meta_gradient=coordinate_second_order \
+    method.basis_maintenance.enabled=false \
+    method.public_initialization.enabled=true \
+    method.public_initialization.require_checkpoint=true \
+    method.public_initialization.checkpoint_path=artifacts/public_initialization.pt \
+    experiment.num_rounds=1 \
+    experiment.client_fraction=1.0 \
+    experiment.eval_every_rounds=999 \
+    experiment.eval_inner_steps='[0]' \
+    experiment.selection_adaptation_steps=0 \
+    checkpoint.save_every_rounds=1 \
+    checkpoint.keep_last=1 \
+    output_dir="outputs/diagnostics/coordinate_second_order/$RUN_ID"
+done
+
+uv run python scripts/summarize_meta_feedback.py \
+  outputs/diagnostics/coordinate_second_order
+```
+
+`method.inner_loop.second_order_steps=null` 恢复完整 5 步坐标二阶递推；
+`method.inner_loop.hessian_damping` 实现 $(H_{cc}+\lambda I)v$。当前扫描中固定
+Tikhonov 阻尼 100/1000 均未优于低学习率加 1 步截断，因此默认保持为 0。
 
 ### 17.6 为什么没有真实网络通信
 

@@ -8,9 +8,12 @@ from dataclasses import dataclass
 import torch
 from torch import Tensor
 
-from client.state import InnerLoopConfig, MetaGradientMode
+from client.state import (
+    InnerLoopConfig,
+    MetaGradientMode,
+    MetaGradientStepDiagnostic,
+)
 from model.prompt_subspace import PromptSubspace
-
 
 SupportLoss = Callable[[Tensor, int], Tensor]
 QueryLoss = Callable[[Tensor], Tensor]
@@ -23,7 +26,9 @@ class AdaptationResult:
     terminal_coordinates: Tensor
     terminal_residual: Tensor
     support_losses: tuple[float, ...]
+    support_monitor_losses: tuple[float, ...]
     query_loss: float
+    second_order_diagnostics: tuple[MetaGradientStepDiagnostic, ...] = ()
 
     @property
     def mean_support_loss(self) -> float:
@@ -57,8 +62,23 @@ def _project_if_requested(
     return subspace.project_residual(residual) if config.project_residual else residual
 
 
+def _monitor_support_loss(
+    monitor_loss: QueryLoss | None,
+    subspace: PromptSubspace,
+    coordinates: Tensor,
+    residual: Tensor,
+) -> float | None:
+    if monitor_loss is None:
+        return None
+    with torch.no_grad():
+        prompt = subspace(coordinates.detach(), residual.detach())
+        loss = _scalar_loss("support_monitor_loss", monitor_loss(prompt))
+    return float(loss)
+
+
 def _detached_adaptation(
     support_loss: SupportLoss,
+    support_monitor_loss: QueryLoss | None,
     subspace: PromptSubspace,
     initial_coordinates: Tensor,
     initial_residual: Tensor | None,
@@ -66,6 +86,7 @@ def _detached_adaptation(
 ) -> tuple[
     list[Tensor],
     list[Tensor],
+    tuple[float, ...],
     tuple[float, ...],
 ]:
     coordinates = (
@@ -89,11 +110,6 @@ def _detached_adaptation(
         config,
     )
 
-    residual = _clip_frobenius_norm(
-        residual,
-        config.residual_max_norm,
-    )
-
     residual = (
         residual
         .detach()
@@ -103,6 +119,15 @@ def _detached_adaptation(
     coordinate_states = [coordinates.detach()]
     residual_states = [residual.detach()]
     loss_values: list[float] = []
+    monitor_values: list[float] = []
+    initial_monitor = _monitor_support_loss(
+        support_monitor_loss,
+        subspace,
+        coordinates,
+        residual,
+    )
+    if initial_monitor is not None:
+        monitor_values.append(initial_monitor)
 
     for step in range(config.steps):
         prompt = subspace(
@@ -142,11 +167,6 @@ def _detached_adaptation(
 
         residual_update = -config.residual_lr * residual_grad
 
-        residual_update = _clip_frobenius_norm(
-            residual_update,
-            config.residual_update_max_norm,
-        )
-
         next_residual = (
             residual + residual_update
         )
@@ -155,11 +175,6 @@ def _detached_adaptation(
             next_residual,
             subspace,
             config,
-        )
-
-        next_residual = _clip_frobenius_norm(
-            next_residual,
-            config.residual_max_norm,
         )
 
         residual = (
@@ -177,11 +192,20 @@ def _detached_adaptation(
         loss_values.append(
             float(task_loss.detach())
         )
+        monitor_value = _monitor_support_loss(
+            support_monitor_loss,
+            subspace,
+            coordinates,
+            residual,
+        )
+        if monitor_value is not None:
+            monitor_values.append(monitor_value)
 
     return (
         coordinate_states,
         residual_states,
         tuple(loss_values),
+        tuple(monitor_values),
     )
 
 def _query_coordinate_gradient(
@@ -204,14 +228,20 @@ def _coordinate_second_order_feedback(
     coordinate_states: list[Tensor],
     residual_states: list[Tensor],
     config: InnerLoopConfig,
-) -> tuple[Tensor, Tensor]:
+) -> tuple[Tensor, Tensor, tuple[MetaGradientStepDiagnostic, ...]]:
     query_value, vector = _query_coordinate_gradient(
         query_loss,
         subspace,
         coordinate_states[-1],
         residual_states[-1],
     )
-    for step in range(config.steps - 1, -1, -1):
+    diagnostics: list[MetaGradientStepDiagnostic] = []
+    backward_steps = min(
+        config.steps,
+        config.second_order_steps or config.steps,
+    )
+    first_step = config.steps - backward_steps
+    for step in range(config.steps - 1, first_step - 1, -1):
         coordinates = coordinate_states[step].detach().requires_grad_(True)
         residual = residual_states[step].detach()
         prompt = subspace(coordinates, residual)
@@ -230,12 +260,40 @@ def _coordinate_second_order_feedback(
             )[0]
         else:
             hessian_vector = torch.zeros_like(coordinates)
-        vector = vector - config.coordinate_lr * hessian_vector
-    return query_value, vector
+        vector_before = vector
+        damped_hessian_vector = (
+            hessian_vector + config.hessian_damping * vector_before
+        )
+        vector = vector - config.coordinate_lr * damped_hessian_vector
+        denominator = vector_before.detach().float().square().sum()
+        rayleigh = (
+            torch.dot(
+                vector_before.detach().float(),
+                hessian_vector.detach().float(),
+            )
+            / denominator.clamp_min(1.0e-30)
+        )
+        diagnostics.append(
+            MetaGradientStepDiagnostic(
+                step=step,
+                vector_norm_before=float(
+                    torch.linalg.vector_norm(vector_before.detach().float())
+                ),
+                hessian_vector_norm=float(
+                    torch.linalg.vector_norm(hessian_vector.detach().float())
+                ),
+                vector_norm_after=float(
+                    torch.linalg.vector_norm(vector.detach().float())
+                ),
+                rayleigh_quotient=float(rayleigh),
+            )
+        )
+    return query_value, vector, tuple(diagnostics)
 
 
 def _full_second_order_adaptation(
     support_loss: SupportLoss,
+    support_monitor_loss: QueryLoss | None,
     query_loss: QueryLoss,
     subspace: PromptSubspace,
     initial_coordinates: Tensor,
@@ -256,6 +314,15 @@ def _full_second_order_adaptation(
     )
     residual = _project_if_requested(residual, subspace, config).detach().requires_grad_(True)
     loss_values: list[float] = []
+    monitor_values: list[float] = []
+    initial_monitor = _monitor_support_loss(
+        support_monitor_loss,
+        subspace,
+        coordinates,
+        residual,
+    )
+    if initial_monitor is not None:
+        monitor_values.append(initial_monitor)
 
     for step in range(config.steps):
         prompt = subspace(coordinates, residual)
@@ -273,6 +340,14 @@ def _full_second_order_adaptation(
             config,
         )
         loss_values.append(float(task_loss.detach()))
+        monitor_value = _monitor_support_loss(
+            support_monitor_loss,
+            subspace,
+            coordinates,
+            residual,
+        )
+        if monitor_value is not None:
+            monitor_values.append(monitor_value)
 
     query_value = _scalar_loss("query_loss", query_loss(subspace(coordinates, residual)))
     feedback = torch.autograd.grad(query_value, coordinates_0)[0]
@@ -282,6 +357,7 @@ def _full_second_order_adaptation(
         terminal_coordinates=coordinates.detach(),
         terminal_residual=residual.detach(),
         support_losses=tuple(loss_values),
+        support_monitor_losses=tuple(monitor_values),
         query_loss=float(query_value.detach()),
     )
 
@@ -289,6 +365,7 @@ def _full_second_order_adaptation(
 def adapt_and_compute_feedback(
     *,
     support_loss: SupportLoss,
+    support_monitor_loss: QueryLoss | None = None,
     query_loss: QueryLoss,
     subspace: PromptSubspace,
     initial_coordinates: Tensor,
@@ -309,6 +386,7 @@ def adapt_and_compute_feedback(
     if config.meta_gradient is MetaGradientMode.FULL_SECOND_ORDER:
         return _full_second_order_adaptation(
             support_loss,
+            support_monitor_loss,
             query_loss,
             subspace,
             initial_coordinates,
@@ -316,12 +394,15 @@ def adapt_and_compute_feedback(
             config,
         )
 
-    coordinate_states, residual_states, support_losses = _detached_adaptation(
+    coordinate_states, residual_states, support_losses, support_monitor_losses = (
+        _detached_adaptation(
         support_loss,
+        support_monitor_loss,
         subspace,
         initial_coordinates,
         initial_residual,
         config,
+        )
     )
     if config.meta_gradient is MetaGradientMode.FIRST_ORDER:
         query_value, feedback = _query_coordinate_gradient(
@@ -331,7 +412,7 @@ def adapt_and_compute_feedback(
             residual_states[-1],
         )
     elif config.meta_gradient is MetaGradientMode.COORDINATE_SECOND_ORDER:
-        query_value, feedback = _coordinate_second_order_feedback(
+        query_value, feedback, diagnostics = _coordinate_second_order_feedback(
             support_loss,
             query_loss,
             subspace,
@@ -348,28 +429,11 @@ def adapt_and_compute_feedback(
         terminal_coordinates=coordinate_states[-1],
         terminal_residual=residual_states[-1],
         support_losses=support_losses,
+        support_monitor_losses=support_monitor_losses,
         query_loss=float(query_value.detach()),
+        second_order_diagnostics=(
+            diagnostics
+            if config.meta_gradient is MetaGradientMode.COORDINATE_SECOND_ORDER
+            else ()
+        ),
     )
-
-def _clip_frobenius_norm(
-    value: Tensor,
-    max_norm: float | None,
-    *,
-    eps: float = 1.0e-12,
-) -> Tensor:
-    if max_norm is None:
-        return value
-
-    work = value.float()
-    norm = torch.linalg.vector_norm(work)
-
-    scale = torch.clamp(
-        torch.as_tensor(
-            max_norm,
-            device=value.device,
-            dtype=work.dtype,
-        ) / norm.clamp_min(eps),
-        max=1.0,
-    )
-
-    return (work * scale).to(dtype=value.dtype)

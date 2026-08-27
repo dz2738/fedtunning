@@ -15,7 +15,7 @@ from client.state import (
     InnerLoopConfig,
     MetaGradientMode,
 )
-from data.schema import TaskDescription
+from data.schema import DataSplit, TaskDescription
 from model.coordinate_generator import CoordinateGenerator, CoordinateGeneratorConfig
 from model.prompt_subspace import PromptSubspace
 from server.aggregation import ServerOptimizerConfig
@@ -78,18 +78,25 @@ class SyntheticClient:
         config: InnerLoopConfig,
         round_seed: int,
         return_residual: bool,
+        residual_upload_max_norm: float | None = None,
     ) -> ClientRoundResult:
         del round_seed
         self.state.assign_group(group_id)
         support_loss, query_loss = self._losses()
         adaptation = adapt_and_compute_feedback(
             support_loss=support_loss,
+            support_monitor_loss=lambda prompt: support_loss(prompt, 0),
             query_loss=query_loss,
             subspace=subspace,
             initial_coordinates=initial_coordinates,
             config=config,
         )
         residual_energy = float(adaptation.terminal_residual.square().sum())
+        uploaded_residual = adaptation.terminal_residual
+        if residual_upload_max_norm is not None:
+            norm = torch.linalg.vector_norm(uploaded_residual.float())
+            scale = min(1.0, residual_upload_max_norm / max(float(norm), 1.0e-12))
+            uploaded_residual = uploaded_residual * scale
         return ClientRoundResult(
             client_id=self.state.client_id,
             group_id=group_id,
@@ -97,12 +104,15 @@ class SyntheticClient:
             coordinate_feedback=adaptation.coordinate_feedback,
             initial_coordinates=adaptation.initial_coordinates,
             terminal_coordinates=adaptation.terminal_coordinates,
-            terminal_residual=adaptation.terminal_residual if return_residual else None,
+            terminal_residual=uploaded_residual if return_residual else None,
             residual_energy=residual_energy,
             mean_support_loss=adaptation.mean_support_loss,
             query_loss=adaptation.query_loss,
             support_examples=4,
             query_examples=3,
+            second_order_diagnostics=adaptation.second_order_diagnostics,
+            support_losses=adaptation.support_losses,
+            support_monitor_losses=adaptation.support_monitor_losses,
         )
 
     def evaluate_loss(
@@ -114,6 +124,7 @@ class SyntheticClient:
         config: InnerLoopConfig,
         adaptation_steps: int,
         seed: int,
+        split: DataSplit = DataSplit.TEST,
     ) -> ClientEvaluationResult:
         del seed
         support_loss, query_loss = self._losses()
@@ -147,6 +158,9 @@ class SyntheticClient:
             residual_energy=residual_energy,
             support_examples=4,
             test_examples=2,
+            split=split,
+            metric_name="accuracy",
+            metric_value=1.0 / (1.0 + float(loss.detach())),
         )
 
 
@@ -185,6 +199,9 @@ def test_two_group_training_uses_one_generator_and_one_backbone() -> None:
             lr=0.02,
             weight_decay=0.0,
             max_grad_norm=100.0,
+            feedback_max_norm=0.01,
+            warmup_rounds=2,
+            decay_rate=1.0,
             coordinate_regularization=0.0,
             group_weighting="uniform",
             client_weighting="query_examples",
@@ -213,6 +230,9 @@ def test_two_group_training_uses_one_generator_and_one_backbone() -> None:
         {client_id: client.state for client_id, client in clients.items()},
         embeddings,
     )
+    grouping_report = server.grouping_report()
+    assert set(grouping_report["task_similarity"]) == {"task_a", "task_b"}
+    assert len(grouping_report["groups"]) == 2
     initial_parameters = {
         name: parameter.detach().clone()
         for name, parameter in generator.named_parameters()
@@ -237,6 +257,28 @@ def test_two_group_training_uses_one_generator_and_one_backbone() -> None:
     assert len(result.rounds) == 2
     assert len(result.evaluations) == 2
     assert all(len(summary.client_results) == 4 for summary in result.evaluations)
+    assert all(summary.split is DataSplit.VALIDATION for summary in result.evaluations)
+    assert all(len(summary.task_metrics) == 2 for summary in result.evaluations)
+    assert result.rounds[0].aggregation.learning_rate == 0.01
+    assert result.rounds[1].aggregation.learning_rate == 0.02
+    assert all(
+        summary.aggregation.feedback_clipped_clients > 0
+        for summary in result.rounds
+    )
+    assert all(
+        summary.aggregation.gradient_norm_after_clip <= 100.0001
+        for summary in result.rounds
+    )
+    assert all(
+        len(summary.aggregation.second_order_trace) == 2
+        for summary in result.rounds
+    )
+    assert all(
+        len(trace.training_support_losses) == 2
+        and len(trace.support_monitor_losses) == 3
+        for summary in result.rounds
+        for trace in summary.client_adaptation
+    )
     assert all(
         torch.isfinite(torch.tensor(summary.mean_test_loss))
         for summary in result.evaluations
@@ -249,3 +291,10 @@ def test_two_group_training_uses_one_generator_and_one_backbone() -> None:
         not torch.allclose(parameter, initial_parameters[name])
         for name, parameter in generator.named_parameters()
     )
+
+    legacy_state = dict(server.checkpoint_state())
+    legacy_module = dict(legacy_state["module"])
+    legacy_module.pop("generator_trainer._update_step")
+    legacy_state["module"] = legacy_module
+    server.load_checkpoint_state(legacy_state)
+    assert int(server.generator_trainer._update_step) == 2

@@ -65,6 +65,8 @@ class ClassificationAdapter(TaskAdapter):
         label_names: Sequence[str] | None,
     ) -> str:
         label = _get_required(row, spec.target_field)
+        if isinstance(label, bool) or type(label).__name__ == "bool_":
+            return "yes" if bool(label) else "no"
         if isinstance(label, int) and label_names is not None:
             if label < 0 or label >= len(label_names):
                 raise TaskFormatError(f"label index {label} is outside label_names")
@@ -237,7 +239,10 @@ class TaskAdapterRegistry:
 
 def build_default_registry() -> TaskAdapterRegistry:
     registry = TaskAdapterRegistry()
-    registry.register(TaskType.CLASSIFICATION, ClassificationAdapter())
+    classification = ClassificationAdapter()
+    registry.register(TaskType.CLASSIFICATION, classification)
+    registry.register(TaskType.NATURAL_LANGUAGE_INFERENCE, classification)
+    registry.register(TaskType.BOOLEAN_QA, classification)
     registry.register(TaskType.SEQUENCE_LABELING, SequenceLabelingAdapter())
     registry.register(TaskType.QUESTION_ANSWERING, QuestionAnsweringAdapter())
     registry.register(TaskType.SUMMARIZATION, SummarizationAdapter())

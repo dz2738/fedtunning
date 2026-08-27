@@ -13,7 +13,8 @@ from torch import Tensor
 @dataclass(frozen=True, slots=True)
 class GroupingConfig:
     similarity: str = "cosine"
-    assignment_threshold: float = 0.65
+    strategy: str = "agglomerative"
+    assignment_threshold: float = 0.95
     centroid_eps: float = 1.0e-12
     create_new_group: bool = True
     freeze_during_normal_training: bool = True
@@ -21,6 +22,8 @@ class GroupingConfig:
     def __post_init__(self) -> None:
         if self.similarity != "cosine":
             raise ValueError("the revised method supports only cosine similarity")
+        if self.strategy not in {"agglomerative", "incremental"}:
+            raise ValueError("grouping strategy must be 'agglomerative' or 'incremental'")
         if not -1.0 <= self.assignment_threshold <= 1.0:
             raise ValueError("assignment_threshold must be in [-1, 1]")
         if self.centroid_eps <= 0:
@@ -36,7 +39,8 @@ class GroupingConfig:
             )
         return cls(
             similarity=str(value.get("similarity", "cosine")),
-            assignment_threshold=float(value.get("assignment_threshold", 0.65)),
+            strategy=str(value.get("strategy", "agglomerative")),
+            assignment_threshold=float(value.get("assignment_threshold", 0.95)),
             centroid_eps=float(value.get("centroid_eps", 1.0e-12)),
             create_new_group=bool(value.get("create_new_group", True)),
             freeze_during_normal_training=bool(
@@ -223,8 +227,62 @@ class SemanticGrouper:
         self._assignments.clear()
         self._next_group_index = 0
         self._frozen = False
-        for client_id in sorted(embeddings):
-            self.assign(client_id, embeddings[client_id])
+        if self.config.strategy == "agglomerative":
+            self._fit_agglomerative(embeddings)
+        else:
+            for client_id in sorted(embeddings):
+                self.assign(client_id, embeddings[client_id])
         if self.config.freeze_during_normal_training:
             self.freeze()
         return self.assignments
+
+    def _fit_agglomerative(self, embeddings: Mapping[str, Tensor]) -> None:
+        """Deterministic centroid-linkage clustering independent of input order."""
+
+        normalized = {
+            item_id: normalize_embedding(
+                embedding,
+                eps=self.config.centroid_eps,
+            )
+            for item_id, embedding in sorted(embeddings.items())
+        }
+        clusters: list[tuple[str, ...]] = [(item_id,) for item_id in normalized]
+
+        def centroid(members: tuple[str, ...]) -> Tensor:
+            mean = torch.stack([normalized[item_id] for item_id in members]).mean(dim=0)
+            return normalize_embedding(mean, eps=self.config.centroid_eps)
+
+        while len(clusters) > 1:
+            best: tuple[float, tuple[str, ...], tuple[str, ...], int, int] | None = None
+            for left_index, left in enumerate(clusters):
+                left_centroid = centroid(left)
+                for right_index in range(left_index + 1, len(clusters)):
+                    right = clusters[right_index]
+                    score = float(torch.dot(left_centroid, centroid(right)))
+                    candidate = (score, left, right, left_index, right_index)
+                    if best is None or score > best[0] or (
+                        score == best[0] and (left, right) < (best[1], best[2])
+                    ):
+                        best = candidate
+            if best is None or best[0] < self.config.assignment_threshold:
+                break
+            _, left, right, left_index, right_index = best
+            merged = tuple(sorted((*left, *right)))
+            clusters = [
+                members
+                for index, members in enumerate(clusters)
+                if index not in {left_index, right_index}
+            ]
+            clusters.append(merged)
+            clusters.sort()
+
+        for members in sorted(clusters):
+            group_id = self._new_group_id()
+            member_embeddings = {item_id: normalized[item_id] for item_id in members}
+            self._clusters[group_id] = SemanticCluster(
+                group_id=group_id,
+                members=member_embeddings,
+                centroid=centroid(members),
+            )
+            for item_id in members:
+                self._assignments[item_id] = group_id

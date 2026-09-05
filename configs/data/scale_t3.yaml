@@ -1,9 +1,9 @@
-name: prototype
+name: scale_t3
 cache_dir: .cache/huggingface
 streaming: false
 offline: false
 row_offset: 0
-max_train_examples_per_dataset: 900
+max_train_examples_per_dataset: 600
 max_validation_examples_per_dataset: 150
 max_test_examples_per_dataset: 150
 clients_per_dataset: 2
@@ -60,64 +60,6 @@ tasks:
     in: premise_and_hypothesis
     out: yes_no_label
     dom: news_and_wikipedia
-    lang: en
-- task_id: boolq_qa
-  dataset_path: google/boolq
-  dataset_name: null
-  task_type: boolean_qa
-  input_fields:
-  - question
-  - passage
-  target_field: answer
-  metric: accuracy
-  description:
-    op: boolean_question_answering
-    in: question_and_passage
-    out: yes_no_label
-    dom: wikipedia
-    lang: en
-- task_id: squad_qa
-  dataset_path: rajpurkar/squad
-  dataset_name: null
-  task_type: question_answering
-  input_fields:
-  - question
-  - context
-  target_field: answers
-  metric: squad_f1
-  description:
-    op: extractive_question_answering
-    in: question_and_context
-    out: answer_text
-    dom: general
-    lang: en
-- task_id: xsum_summary
-  dataset_path: EdinburghNLP/xsum
-  dataset_name: null
-  task_type: summarization
-  input_fields:
-  - document
-  target_field: summary
-  metric: rouge_l
-  description:
-    op: abstractive_summarization
-    in: news_article
-    out: free_form_sequence
-    dom: news
-    lang: en
-- task_id: glue_cola
-  dataset_path: nyu-mll/glue
-  dataset_name: cola
-  task_type: classification
-  input_fields:
-  - sentence
-  target_field: label
-  metric: accuracy
-  description:
-    op: grammaticality_classification
-    in: sentence
-    out: yes_no_label
-    dom: linguistics
     lang: en
 text_template:
   include_task_prefix: true

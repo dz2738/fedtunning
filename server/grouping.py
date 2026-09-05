@@ -14,10 +14,11 @@ from torch import Tensor
 class GroupingConfig:
     similarity: str = "cosine"
     strategy: str = "agglomerative"
-    assignment_threshold: float = 0.95
+    assignment_threshold: float = 0.90
     centroid_eps: float = 1.0e-12
     create_new_group: bool = True
     freeze_during_normal_training: bool = True
+    target_num_groups: int | None = None
 
     def __post_init__(self) -> None:
         if self.similarity != "cosine":
@@ -28,6 +29,8 @@ class GroupingConfig:
             raise ValueError("assignment_threshold must be in [-1, 1]")
         if self.centroid_eps <= 0:
             raise ValueError("centroid_eps must be positive")
+        if self.target_num_groups is not None and self.target_num_groups <= 0:
+            raise ValueError("target_num_groups must be positive or None")
 
     @classmethod
     def from_mapping(cls, value: Mapping[str, Any]) -> GroupingConfig:
@@ -37,15 +40,17 @@ class GroupingConfig:
                 "discrete field-support grouping was removed; delete config keys "
                 f"{sorted(removed)}"
             )
+        raw_target = value.get("target_num_groups", 4)
         return cls(
             similarity=str(value.get("similarity", "cosine")),
             strategy=str(value.get("strategy", "agglomerative")),
-            assignment_threshold=float(value.get("assignment_threshold", 0.95)),
+            assignment_threshold=float(value.get("assignment_threshold", 0.90)),
             centroid_eps=float(value.get("centroid_eps", 1.0e-12)),
             create_new_group=bool(value.get("create_new_group", True)),
             freeze_during_normal_training=bool(
                 value.get("freeze_during_normal_training", True)
             ),
+            target_num_groups=None if raw_target is None else int(raw_target),
         )
 
 
@@ -253,6 +258,11 @@ class SemanticGrouper:
             return normalize_embedding(mean, eps=self.config.centroid_eps)
 
         while len(clusters) > 1:
+            if (
+                self.config.target_num_groups is not None
+                and len(clusters) <= self.config.target_num_groups
+            ):
+                break
             best: tuple[float, tuple[str, ...], tuple[str, ...], int, int] | None = None
             for left_index, left in enumerate(clusters):
                 left_centroid = centroid(left)

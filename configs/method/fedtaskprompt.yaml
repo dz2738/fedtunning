@@ -1,13 +1,14 @@
 name: fedtaskprompt
 
-num_basis: 4
+num_basis: 6
 orthogonalize_basis: true
 projection_eps: 1.0e-6
 
 grouping:
   similarity: cosine
   strategy: agglomerative
-  assignment_threshold: 0.95
+  assignment_threshold: 0.90
+  target_num_groups: 5
   centroid_eps: 1.0e-12
   create_new_group: true
   freeze_during_normal_training: true
@@ -26,10 +27,15 @@ public_initialization:
   center_lr: 0.01
   task_steps: 100
   task_lr: 0.01
-  generator_steps: 500
+  generator_steps: 2000
   generator_lr: 0.001
   max_examples_per_task: 128
   batch_size: 8
+  # Type-level M: one public P* per task type. Keep at 1 unless expanding SVD rank.
+  instances_per_task: 1
+  min_examples_per_instance: 16
+  # yes/no verbalizer + BoolQ/RTE 合组负责标签任务；raw 让 SST/CoLA/SQuAD 不被 label_priority 挤掉。
+  svd_energy: raw
 
 inner_loop:
   steps: 5
@@ -41,10 +47,11 @@ inner_loop:
   residual_weight_decay: 1.0e-4
   project_residual: true
   reset_residual_each_round: true
-  meta_gradient: coordinate_second_order
-  # Truncate the coordinate-Hessian reverse recursion while keeping all 5 forward steps.
+  # First-order query gradient wrt shared coordinates; server AdamW is unchanged.
+  # Switch back with method.inner_loop.meta_gradient=coordinate_second_order.
+  meta_gradient: first_order
+  # Used only when meta_gradient is coordinate_second_order.
   second_order_steps: 1
-  # Tikhonov shift: H_cc v -> (H_cc + lambda I) v; 0 preserves the paper formula.
   hessian_damping: 0.0
 
 server_optimizer:

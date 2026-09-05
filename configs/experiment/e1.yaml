@@ -1,0 +1,24 @@
+name: e1
+num_rounds: 50
+client_fraction: 1.0
+min_clients_per_round: 1
+eval_every_rounds: 5
+eval_inner_steps: [0, 1, 3, 5]
+selection_adaptation_steps: 5
+baseline_method: local_prompt
+
+baselines:
+  - local_prompt
+  - fedavg_prompt
+  - shared_local_prompt
+  - ifca_prompt
+  - per_fedavg_prompt
+  - fedtaskprompt
+
+report:
+  task_metrics: true
+  relative_local_gain: true
+  negative_transfer_rate: true
+  worst_client_fraction: 0.1
+  communication: true
+  runtime: true

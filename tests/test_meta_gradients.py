@@ -1,5 +1,6 @@
 from dataclasses import replace
 from itertools import pairwise
+from math import isfinite, isnan
 
 import torch
 
@@ -254,4 +255,52 @@ def test_coordinate_feedback_is_detached_for_server_vjp() -> None:
 
     assert not result.coordinate_feedback.requires_grad
     assert result.coordinate_feedback.shape == (2,)
+
+
+def test_nonfinite_support_monitor_does_not_abort_adaptation() -> None:
+    subspace = PromptSubspace(prompt_length=2, hidden_size=3, num_basis=2)
+    calls = {"n": 0}
+
+    def monitor(prompt: torch.Tensor) -> torch.Tensor:
+        calls["n"] += 1
+        if calls["n"] > 1:
+            return prompt.new_tensor(float("nan"))
+        return prompt.square().mean()
+
+    result = adapt_and_compute_feedback(
+        support_loss=lambda prompt, step: prompt.square().mean(),
+        support_monitor_loss=monitor,
+        query_loss=lambda prompt: prompt.square().mean(),
+        subspace=subspace,
+        initial_coordinates=torch.ones(2),
+        config=InnerLoopConfig(steps=1, meta_gradient=MetaGradientMode.FIRST_ORDER),
+    )
+
+    assert len(result.support_monitor_losses) == 2
+    assert isfinite(result.support_monitor_losses[0])
+    assert isnan(result.support_monitor_losses[1])
+    subspace = PromptSubspace(prompt_length=2, hidden_size=3, num_basis=2)
+
+    class _NanGradient(torch.autograd.Function):
+        @staticmethod
+        def forward(ctx, loss: torch.Tensor) -> torch.Tensor:
+            return loss
+
+        @staticmethod
+        def backward(ctx, grad_output: torch.Tensor) -> torch.Tensor:
+            return grad_output * float("nan")
+
+    result = adapt_and_compute_feedback(
+        support_loss=lambda prompt, step: prompt.square().mean(),
+        query_loss=lambda prompt: _NanGradient.apply(prompt.square().mean()),
+        subspace=subspace,
+        initial_coordinates=torch.ones(2),
+        config=InnerLoopConfig(steps=1, meta_gradient=MetaGradientMode.FIRST_ORDER),
+    )
+
+    assert torch.isfinite(result.coordinate_feedback).all()
+    torch.testing.assert_close(
+        result.coordinate_feedback,
+        torch.zeros_like(result.coordinate_feedback),
+    )
 

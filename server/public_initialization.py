@@ -11,10 +11,14 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor
 
+from data.schema import TaskDescription, TaskSpec
 from model.coordinate_generator import CoordinateGenerator
 
 PromptLoss = Callable[[Tensor], Tensor]
 PUBLIC_INITIALIZATION_FORMAT_VERSION = 1
+SVD_ENERGY_MODES = frozenset({"raw", "unit_task", "label_priority"})
+SEQUENCE_SVD_TASK_TYPES = frozenset({"question_answering", "summarization"})
+LABEL_PRIORITY_SEQUENCE_SCALE = 0.2
 
 
 @dataclass(frozen=True, slots=True)
@@ -30,6 +34,14 @@ class PublicInitializationConfig:
     generator_lr: float = 1.0e-3
     max_examples_per_task: int = 128
     batch_size: int = 8
+    # One SVD column per (task, subset) instance. 1 keeps the old type-level M.
+    instances_per_task: int = 1
+    min_examples_per_instance: int = 16
+    # "raw": SVD on (P*-C) so long-form tasks dominate.
+    # "unit_task": unit-normalize each task difference before SVD.
+    # "label_priority": downweight QA/summarization rows so yes/no and class labels
+    # span the leading K directions instead of copy-span/summary axes.
+    svd_energy: str = "raw"
 
     def __post_init__(self) -> None:
         if min(self.center_steps, self.task_steps, self.generator_steps) < 0:
@@ -38,6 +50,12 @@ class PublicInitializationConfig:
             raise ValueError("public initialization learning rates must be positive")
         if min(self.max_examples_per_task, self.batch_size) <= 0:
             raise ValueError("public task example count and batch size must be positive")
+        if self.instances_per_task <= 0:
+            raise ValueError("instances_per_task must be positive")
+        if self.min_examples_per_instance <= 0:
+            raise ValueError("min_examples_per_instance must be positive")
+        if self.svd_energy not in SVD_ENERGY_MODES:
+            raise ValueError("svd_energy must be 'raw', 'unit_task', or 'label_priority'")
         if self.enabled and self.require_checkpoint and not self.checkpoint_path:
             raise ValueError("enabled required public initialization needs checkpoint_path")
 
@@ -56,7 +74,59 @@ class PublicInitializationConfig:
             generator_lr=float(value.get("generator_lr", 1.0e-3)),
             max_examples_per_task=int(value.get("max_examples_per_task", 128)),
             batch_size=int(value.get("batch_size", 8)),
+            instances_per_task=int(value.get("instances_per_task", 1)),
+            min_examples_per_instance=int(value.get("min_examples_per_instance", 16)),
+            svd_energy=str(value.get("svd_energy", "raw")),
         )
+
+
+def split_public_examples(
+    examples: Sequence[Any],
+    *,
+    num_instances: int,
+    min_examples_per_instance: int,
+) -> tuple[tuple[Any, ...], ...]:
+    """Split one task's public rows into disjoint round-robin subsets."""
+
+    if num_instances <= 0:
+        raise ValueError("num_instances must be positive")
+    if min_examples_per_instance <= 0:
+        raise ValueError("min_examples_per_instance must be positive")
+    rows = tuple(examples)
+    if not rows:
+        raise ValueError("public examples cannot be empty")
+    if num_instances == 1:
+        return (rows,)
+    required = num_instances * min_examples_per_instance
+    if len(rows) < required:
+        raise ValueError(
+            "not enough public examples to form disjoint prompt instances: "
+            f"have {len(rows)}, need at least {required} "
+            f"({num_instances} instances x {min_examples_per_instance} examples)"
+        )
+    buckets: list[list[Any]] = [[] for _ in range(num_instances)]
+    for index, example in enumerate(rows):
+        buckets[index % num_instances].append(example)
+    return tuple(tuple(bucket) for bucket in buckets)
+
+
+def public_instance_description(spec: TaskSpec, index: int) -> TaskDescription:
+    """Cycle authored variants, then lightly retag domain so each instance has a distinct e."""
+
+    if index < 0:
+        raise ValueError("instance index must be non-negative")
+    variants = spec.description_variants or (spec.description,)
+    base = variants[index % len(variants)]
+    cycle = index // len(variants)
+    if cycle == 0:
+        return base
+    return TaskDescription(
+        op=base.op,
+        input_object=base.input_object,
+        output_format=base.output_format,
+        domain=f"{base.domain}_view{cycle}",
+        language=base.language,
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -66,6 +136,7 @@ class PublicTaskObjective:
     num_examples: int
     loss: PromptLoss
     accumulate_backward: Callable[[Tensor, Tensor], Tensor] | None = None
+    task_type: str = ""
 
     def __post_init__(self) -> None:
         if not self.task_id.strip():
@@ -148,14 +219,54 @@ def normalized_example_weights(tasks: Sequence[PublicTaskObjective]) -> Tensor:
     return counts / counts.sum()
 
 
+def _svd_factor_rows(
+    differences: Tensor,
+    svd_energy: str,
+    task_types: Sequence[str] | None,
+) -> Tensor:
+    if svd_energy == "raw":
+        return differences
+    if svd_energy == "unit_task":
+        row_norm = differences.norm(dim=-1, keepdim=True)
+        scale = row_norm.clamp_min(torch.finfo(differences.dtype).eps)
+        svd_rows = differences / scale
+        return torch.where(row_norm > 0, svd_rows, torch.zeros_like(svd_rows))
+    if svd_energy == "label_priority":
+        if task_types is None:
+            raise ValueError("label_priority SVD requires task_types")
+        if len(task_types) != differences.shape[0]:
+            raise ValueError("task_types must contain one value per public task")
+        scales = [
+            LABEL_PRIORITY_SEQUENCE_SCALE
+            if str(task_type) in SEQUENCE_SVD_TASK_TYPES
+            else 1.0
+            for task_type in task_types
+        ]
+        scale = torch.tensor(scales, device=differences.device, dtype=differences.dtype)
+        return differences * scale.unsqueeze(1)
+    raise ValueError("svd_energy must be 'raw', 'unit_task', or 'label_priority'")
+
+
 def weighted_prompt_svd(
     task_prompts: Tensor,
     center: Tensor,
     task_weights: Tensor,
     *,
     num_basis: int,
+    svd_energy: str = "raw",
+    task_types: Sequence[str] | None = None,
 ) -> tuple[Tensor, Tensor, Tensor]:
-    """Apply Eq. (17)--(18) to weighted public-task prompt differences."""
+    """Apply Eq. (17)--(18) to weighted public-task prompt differences.
+
+    ``svd_energy="raw"`` factorizes ``(P*-C)`` directly, so tasks with large
+    prompt displacement (QA/summarization) dominate the leading directions.
+    ``svd_energy="unit_task"`` unit-normalizes each task row before the SVD so
+    every type votes equally on the K-basis; coordinates still come from
+    projecting the original ``(P*-C)`` onto that basis.
+    ``svd_energy="label_priority"`` keeps original magnitudes for classification
+    and yes/no tasks, but scales QA/summarization rows down so copy-span and
+    summary directions do not occupy the entire K-subspace.
+    """
 
     if task_prompts.ndim != 3 or center.ndim != 2:
         raise ValueError("task prompts and center must have shapes [M,L,d] and [L,d]")
@@ -165,12 +276,15 @@ def weighted_prompt_svd(
         raise ValueError("task_weights must contain one value per public task")
     if num_basis <= 0:
         raise ValueError("num_basis must be positive")
+    if svd_energy not in SVD_ENERGY_MODES:
+        raise ValueError("svd_energy must be 'raw', 'unit_task', or 'label_priority'")
     weights = task_weights.to(device=task_prompts.device, dtype=torch.float32)
     if bool((weights < 0).any()) or not torch.isfinite(weights).all():
         raise ValueError("task_weights must be finite and non-negative")
     weights = weights / weights.sum().clamp_min(torch.finfo(weights.dtype).eps)
     differences = (task_prompts - center).reshape(task_prompts.shape[0], -1).float()
-    weighted_matrix = differences.transpose(0, 1) * weights.sqrt().unsqueeze(0)
+    svd_rows = _svd_factor_rows(differences, svd_energy, task_types)
+    weighted_matrix = svd_rows.transpose(0, 1) * weights.sqrt().unsqueeze(0)
     left_vectors, singular_values, _ = torch.linalg.svd(weighted_matrix, full_matrices=False)
     if singular_values.numel() == 0:
         rank = 0
@@ -319,6 +433,8 @@ def build_public_initialization(
         center,
         weights,
         num_basis=num_basis,
+        svd_energy=config.svd_energy,
+        task_types=tuple(task.task_type for task in tasks),
     )
     embeddings = torch.stack([task.embedding.detach().float().cpu() for task in tasks])
     prototype = F.normalize((weights[:, None] * embeddings).sum(dim=0), p=2, dim=0)

@@ -22,7 +22,9 @@ from server.public_initialization import (
     PublicInitializationConfig,
     PublicTaskObjective,
     build_public_initialization,
+    public_instance_description,
     save_public_initialization,
+    split_public_examples,
 )
 
 LOGGER = logging.getLogger(__name__)
@@ -100,32 +102,56 @@ def prepare_public_initialization(config: DictConfig) -> Path:
     prompt_config = plain_mapping(config.model.prompt)
     text_config = plain_mapping(config.public_data.text_template)
     public_tasks: list[PublicTaskObjective] = []
+    instance_records: list[dict[str, object]] = []
     for task_id in sorted(data.tasks):
         task_clients = data.clients_for_task(task_id)
         if not task_clients:
             raise ValueError(f"public task {task_id!r} has no examples")
+        spec = data.tasks[task_id]
         # Client views share this immutable task-level collection. The offline
         # initializer reads it once and never uses support/query/test membership.
         examples = tuple(task_clients[0].examples[: public_config.max_examples_per_task])
-        tokenized = tuple(
-            backbone.tokenize(
-                [example.input_text for example in batch],
-                [example.target_text for example in batch],
-                max_source_length=int(text_config.get("max_source_length", 384)),
-                max_target_length=int(text_config.get("max_target_length", 96)),
-            )
-            for batch in _batched(examples, public_config.batch_size)
+        subsets = split_public_examples(
+            examples,
+            num_instances=public_config.instances_per_task,
+            min_examples_per_instance=public_config.min_examples_per_instance,
         )
-        embedding = task_encoder.encode_descriptions([data.tasks[task_id].description])[0].detach()
-        public_tasks.append(
-            PublicTaskObjective(
-                task_id=task_id,
-                embedding=embedding,
-                num_examples=len(examples),
-                loss=_task_loss(backbone, tokenized),
-                accumulate_backward=_task_accumulate_backward(backbone, tokenized),
+        for instance_index, subset in enumerate(subsets):
+            instance_id = (
+                task_id
+                if public_config.instances_per_task == 1
+                else f"{task_id}#{instance_index}"
             )
-        )
+            tokenized = tuple(
+                backbone.tokenize(
+                    [example.input_text for example in batch],
+                    [example.target_text for example in batch],
+                    max_source_length=int(text_config.get("max_source_length", 384)),
+                    max_target_length=int(text_config.get("max_target_length", 96)),
+                )
+                for batch in _batched(subset, public_config.batch_size)
+            )
+            description = public_instance_description(spec, instance_index)
+            embedding = task_encoder.encode_descriptions([description])[0].detach()
+            public_tasks.append(
+                PublicTaskObjective(
+                    task_id=instance_id,
+                    embedding=embedding,
+                    num_examples=len(subset),
+                    loss=_task_loss(backbone, tokenized),
+                    accumulate_backward=_task_accumulate_backward(backbone, tokenized),
+                    task_type=str(spec.task_type),
+                )
+            )
+            instance_records.append(
+                {
+                    "instance_id": instance_id,
+                    "source_task_id": task_id,
+                    "description": description.as_dict(),
+                    "num_examples": len(subset),
+                    "example_ids": [example.example_id for example in subset],
+                }
+            )
 
     initial_center = torch.zeros(
         int(prompt_config["length"]),
@@ -144,6 +170,20 @@ def prepare_public_initialization(config: DictConfig) -> Path:
     public_manifest = {
         "seed": seed + 1_000_000,
         "public_data_config": OmegaConf.to_container(config.public_data, resolve=True),
+        "instances_per_task": public_config.instances_per_task,
+        "num_prompt_instances": len(public_tasks),
+        "singular_values": artifact.singular_values.tolist(),
+        "svd_energy": public_config.svd_energy,
+        "task_types": {task.task_id: task.task_type for task in public_tasks},
+        "task_coordinate_norms": {
+            task_id: float(norm)
+            for task_id, norm in zip(
+                artifact.task_ids,
+                artifact.task_coordinates.float().norm(dim=-1),
+                strict=True,
+            )
+        },
+        "instances": instance_records,
         "tasks": {
             task_id: {
                 "num_examples": len(data.clients_for_task(task_id)[0].examples),
@@ -160,8 +200,9 @@ def prepare_public_initialization(config: DictConfig) -> Path:
         encoding="utf-8",
     )
     LOGGER.info(
-        "saved public initialization path=%s tasks=%d basis=%d",
+        "saved public initialization path=%s types=%d instances=%d basis=%d",
         destination,
+        len(data.tasks),
         len(public_tasks),
         num_basis,
     )

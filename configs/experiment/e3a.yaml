@@ -1,0 +1,21 @@
+name: e3a
+num_rounds: 50
+client_fraction: 1.0
+min_clients_per_round: 1
+eval_every_rounds: 5
+eval_inner_steps: [0, 1, 3, 5, 10]
+selection_adaptation_steps: 5
+
+holdout:
+  strategy: one_client_per_task
+  fraction: 0.2
+  expose_task_description: true
+  expose_training_updates: false
+
+adaptation_steps: [0, 1, 3, 5, 10]
+initializers:
+  - zero
+  - group_mean
+  - nearest_task
+  - semantic_generator
+  - oracle_group

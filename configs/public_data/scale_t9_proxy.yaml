@@ -1,4 +1,4 @@
-name: prototype_proxy
+name: scale_t9_proxy
 cache_dir: .cache/huggingface
 streaming: false
 offline: false
@@ -118,6 +118,36 @@ tasks:
     in: sentence
     out: yes_no_label
     dom: linguistics
+    lang: en
+- task_id: glue_mrpc
+  dataset_path: nyu-mll/glue
+  dataset_name: mrpc
+  task_type: classification
+  input_fields:
+  - sentence1
+  - sentence2
+  target_field: label
+  metric: accuracy
+  description:
+    op: paraphrase_detection
+    in: sentence_pair
+    out: categorical_label
+    dom: news
+    lang: en
+- task_id: glue_qnli
+  dataset_path: nyu-mll/glue
+  dataset_name: qnli
+  task_type: natural_language_inference
+  input_fields:
+  - question
+  - sentence
+  target_field: label
+  metric: accuracy
+  description:
+    op: question_answering_nli
+    in: question_and_sentence
+    out: categorical_label
+    dom: wikipedia
     lang: en
 text_template:
   include_task_prefix: true

@@ -248,7 +248,7 @@ def build_runtime(config: DictConfig) -> ExperimentRuntime:
             state=ClientState(
                 client_id=client_id,
                 task_id=client_data.task.task_id,
-                description=client_data.task.description,
+                description=client_data.description,
             ),
             data=client_data,
             backbone=backbone,

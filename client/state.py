@@ -29,7 +29,7 @@ class InnerLoopConfig:
     residual_weight_decay: float = 1.0e-4
     project_residual: bool = True
     reset_residual_each_round: bool = True
-    meta_gradient: MetaGradientMode = MetaGradientMode.COORDINATE_SECOND_ORDER
+    meta_gradient: MetaGradientMode = MetaGradientMode.FIRST_ORDER
     second_order_steps: int | None = None
     hessian_damping: float = 0.0
 
@@ -60,7 +60,7 @@ class InnerLoopConfig:
             project_residual=bool(value.get("project_residual", True)),
             reset_residual_each_round=bool(value.get("reset_residual_each_round", True)),
             meta_gradient=MetaGradientMode(
-                str(value.get("meta_gradient", MetaGradientMode.COORDINATE_SECOND_ORDER))
+                str(value.get("meta_gradient", MetaGradientMode.FIRST_ORDER))
             ),
             second_order_steps=(
                 None

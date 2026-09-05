@@ -7,6 +7,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
+import math
 import torch
 from torch import Tensor, nn
 
@@ -223,7 +224,12 @@ class SharedGeneratorTrainer(nn.Module):
                     device=parameter.device,
                     dtype=parameter.dtype,
                 )
+                if not torch.isfinite(value).all():
+                    value = torch.zeros_like(value)
                 norm = float(torch.linalg.vector_norm(value.float()))
+                if not math.isfinite(norm):
+                    value = torch.zeros_like(value)
+                    norm = 0.0
                 feedback_norms.append(norm)
                 if norm > self.settings.feedback_max_norm:
                     value = value * (self.settings.feedback_max_norm / norm)

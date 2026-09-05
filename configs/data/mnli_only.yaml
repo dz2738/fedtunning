@@ -1,0 +1,39 @@
+name: mnli_only
+cache_dir: .cache/huggingface
+streaming: false
+offline: false
+row_offset: 0
+max_train_examples_per_dataset: 900
+max_validation_examples_per_dataset: 150
+max_test_examples_per_dataset: 150
+clients_per_dataset: 2
+partition:
+  strategy: dirichlet
+  dirichlet_alpha: 0.5
+  min_examples_per_client: 24
+  size_imbalance: 0.0
+split:
+  support_ratio: 0.5
+  query_ratio: 0.2
+  validation_ratio: 0.1
+  test_ratio: 0.2
+tasks:
+- task_id: glue_mnli
+  dataset_path: nyu-mll/glue
+  dataset_name: mnli
+  task_type: natural_language_inference
+  input_fields:
+  - premise
+  - hypothesis
+  target_field: label
+  metric: accuracy
+  description:
+    op: multi_genre_textual_entailment
+    in: premise_and_hypothesis
+    out: three_way_label
+    dom: mixed_genre
+    lang: en
+text_template:
+  include_task_prefix: true
+  max_source_length: 384
+  max_target_length: 96

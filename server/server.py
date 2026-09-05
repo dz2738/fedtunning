@@ -86,6 +86,8 @@ class FedTaskPromptServer(nn.Module):
         self._task_embeddings: dict[str, Tensor] = {}
         self._task_level_embeddings: dict[str, Tensor] = {}
         self._client_assignments: dict[str, str] = {}
+        self._client_task_ids: dict[str, str] = {}
+        self._client_descriptions: dict[str, str] = {}
         self._round_number = 0
         self._public_center = None if public_center is None else public_center.detach().clone()
         self._public_basis = None if public_basis is None else public_basis.detach().clone()
@@ -111,6 +113,7 @@ class FedTaskPromptServer(nn.Module):
         return {
             "strategy": self.grouper.config.strategy,
             "assignment_threshold": self.grouper.config.assignment_threshold,
+            "target_num_groups": self.grouper.config.target_num_groups,
             "task_similarity": {
                 left: {
                     right: max(
@@ -126,12 +129,23 @@ class FedTaskPromptServer(nn.Module):
             },
             "groups": {
                 group_id: {
-                    "tasks": list(self.grouper.members(group_id)),
+                    "tasks": sorted(
+                        {
+                            self._client_task_ids[client_id]
+                            for client_id, assigned_group in self._client_assignments.items()
+                            if assigned_group == group_id and client_id in self._client_task_ids
+                        }
+                    ),
                     "clients": sorted(
                         client_id
                         for client_id, assigned_group in self._client_assignments.items()
                         if assigned_group == group_id
                     ),
+                    "client_descriptions": {
+                        client_id: self._client_descriptions[client_id]
+                        for client_id, assigned_group in sorted(self._client_assignments.items())
+                        if assigned_group == group_id and client_id in self._client_descriptions
+                    },
                 }
                 for group_id in self.grouper.group_ids
             },
@@ -140,24 +154,13 @@ class FedTaskPromptServer(nn.Module):
     def initialize_groups(self, clients: Mapping[str, ClientState]) -> dict[str, str]:
         if not clients:
             raise ValueError("clients cannot be empty")
-        task_representatives: dict[str, ClientState] = {}
-        for client_id in sorted(clients):
-            state = clients[client_id]
-            representative = task_representatives.setdefault(state.task_id, state)
-            if representative.description != state.description:
-                raise ValueError(
-                    f"clients for task {state.task_id!r} have inconsistent descriptions"
-                )
-        task_ids = tuple(sorted(task_representatives))
-        descriptions = [task_representatives[task_id].description for task_id in task_ids]
-        encoded = self.task_encoder.encode_descriptions(descriptions).detach().float().cpu()
-        by_task = {
-            task_id: embedding
-            for task_id, embedding in zip(task_ids, encoded, strict=True)
-        }
+        client_ids = tuple(sorted(clients))
+        encoded = self.task_encoder.encode_descriptions(
+            [clients[client_id].description for client_id in client_ids]
+        ).detach().float().cpu()
         embeddings = {
-            client_id: by_task[state.task_id]
-            for client_id, state in clients.items()
+            client_id: embedding
+            for client_id, embedding in zip(client_ids, encoded, strict=True)
         }
         return self.initialize_groups_from_embeddings(clients, embeddings)
 
@@ -166,13 +169,20 @@ class FedTaskPromptServer(nn.Module):
         clients: Mapping[str, ClientState],
         embeddings: Mapping[str, Tensor],
     ) -> dict[str, str]:
-        """Build dynamic group modules from precomputed or checkpointed embeddings."""
+        """Cluster clients by their own description embeddings."""
 
         if set(clients) != set(embeddings):
             raise ValueError("client IDs and task-embedding IDs must match")
         self._task_embeddings = {
             client_id: embedding.detach().float().cpu()
             for client_id, embedding in embeddings.items()
+        }
+        self._client_task_ids = {
+            client_id: state.task_id for client_id, state in clients.items()
+        }
+        self._client_descriptions = {
+            client_id: state.description.serialize()
+            for client_id, state in clients.items()
         }
         task_members: dict[str, list[str]] = defaultdict(list)
         for client_id, state in clients.items():
@@ -184,40 +194,99 @@ class FedTaskPromptServer(nn.Module):
             ).mean(dim=0)
             for task_id, client_ids in sorted(task_members.items())
         }
-        task_assignments = self.grouper.fit(self._task_level_embeddings)
-        assignments = {
-            client_id: task_assignments[state.task_id]
-            for client_id, state in clients.items()
-        }
+        assignments = self.grouper.fit(self._task_embeddings)
         self._client_assignments = assignments
-
-        parameter = next(self.generator_trainer.generator.parameters())
         self.groups = nn.ModuleDict()
         for group_id in self.grouper.group_ids:
-            group = GroupState(
-                group_id=group_id,
-                semantic_prototype=self.grouper.centroid(group_id),
-                prompt_length=self.prompt_length,
-                hidden_size=self.hidden_size,
-                num_basis=self.num_basis,
-                prompt_init_std=self.prompt_init_std,
-                projection_eps=self.projection_eps,
-                device=parameter.device,
-                dtype=self.prompt_dtype,
+            self.groups[group_id] = self._build_group(
+                group_id,
+                client_ids=tuple(
+                    client_id
+                    for client_id, assigned_group in assignments.items()
+                    if assigned_group == group_id
+                ),
             )
-            group.set_members(
-                client_id
-                for client_id, assigned_group in assignments.items()
-                if assigned_group == group_id
-            )
-            group.initialize_prompt_subspace(
-                center=self._public_center,
-                basis=self._public_basis,
-            )
-            self.groups[group_id] = group
         for client_id, group_id in assignments.items():
             clients[client_id].assign_group(group_id)
         return assignments
+
+    def _build_group(self, group_id: str, client_ids: Sequence[str]) -> GroupState:
+        parameter = next(self.generator_trainer.generator.parameters())
+        group = GroupState(
+            group_id=group_id,
+            semantic_prototype=self.grouper.centroid(group_id),
+            prompt_length=self.prompt_length,
+            hidden_size=self.hidden_size,
+            num_basis=self.num_basis,
+            prompt_init_std=self.prompt_init_std,
+            projection_eps=self.projection_eps,
+            device=parameter.device,
+            dtype=self.prompt_dtype,
+        )
+        group.set_members(tuple(client_ids))
+        group.initialize_prompt_subspace(
+            center=self._public_center,
+            basis=self._public_basis,
+        )
+        return group
+
+    def admit_task(
+        self,
+        *,
+        task_id: str,
+        clients: Mapping[str, ClientState],
+    ) -> str:
+        """Route an unseen task into an existing or newly created group.
+
+        Training-time ``GroupState`` prototypes are not recomputed, so inductive
+        admission does not rewrite subspaces that already received updates.
+        """
+
+        if not self.groups:
+            raise RuntimeError("initialize_groups must be called before admit_task")
+        task_clients = {
+            client_id: state
+            for client_id, state in clients.items()
+            if state.task_id == task_id
+        }
+        if not task_clients:
+            raise ValueError(f"no clients found for task {task_id!r}")
+        last_group = ""
+        for client_id, state in sorted(task_clients.items()):
+            if client_id in self._client_assignments:
+                last_group = self._client_assignments[client_id]
+                continue
+            embedding = (
+                self.task_encoder.encode_descriptions([state.description])
+                .detach()
+                .float()
+                .cpu()[0]
+            )
+            decision = self.grouper.assign(client_id, embedding)
+            last_group = decision.group_id
+            self._task_embeddings[client_id] = embedding.clone()
+            self._client_task_ids[client_id] = task_id
+            self._client_descriptions[client_id] = state.description.serialize()
+            self._client_assignments[client_id] = decision.group_id
+            state.assign_group(decision.group_id)
+            if decision.created:
+                self.groups[decision.group_id] = self._build_group(
+                    decision.group_id,
+                    client_ids=(client_id,),
+                )
+            else:
+                group = self.groups[decision.group_id]
+                group.set_members((*group.members, client_id))
+        member_ids = [
+            client_id
+            for client_id, assigned in self._client_task_ids.items()
+            if assigned == task_id
+        ]
+        self._task_level_embeddings[task_id] = torch.stack(
+            [self._task_embeddings[client_id] for client_id in member_ids],
+            dim=0,
+        ).mean(dim=0)
+        return last_group
 
     def initial_coordinates(self, client_id: str) -> Tensor:
         if client_id not in self._task_embeddings:

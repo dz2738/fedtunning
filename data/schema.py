@@ -91,6 +91,7 @@ class TaskSpec:
     target_field: str
     metric: str
     description: TaskDescription
+    description_variants: tuple[TaskDescription, ...] = ()
 
     def __post_init__(self) -> None:
         _require_non_empty("task_id", self.task_id)
@@ -102,8 +103,19 @@ class TaskSpec:
         if len(set(self.input_fields)) != len(self.input_fields):
             raise ValueError(f"input_fields contains duplicates: {self.input_fields}")
 
+    def client_description(self, client_index: int) -> TaskDescription:
+        """Return this client's wording; variants cycle if there are fewer than N clients."""
+
+        if client_index < 0:
+            raise ValueError("client_index must be non-negative")
+        variants = self.description_variants or (self.description,)
+        return variants[client_index % len(variants)]
+
     @classmethod
     def from_mapping(cls, value: Mapping[str, Any]) -> TaskSpec:
+        description = TaskDescription.from_mapping(value["description"])
+        raw_variants = value.get("description_variants") or ()
+        variants = tuple(TaskDescription.from_mapping(item) for item in raw_variants)
         return cls(
             task_id=str(value["task_id"]),
             dataset_path=str(value["dataset_path"]),
@@ -114,7 +126,8 @@ class TaskSpec:
             input_fields=tuple(str(item) for item in value["input_fields"]),
             target_field=str(value["target_field"]),
             metric=str(value["metric"]),
-            description=TaskDescription.from_mapping(value["description"]),
+            description=description,
+            description_variants=variants,
         )
 
 

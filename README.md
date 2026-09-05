@@ -108,9 +108,8 @@ $H_{cc}+\lambda I$；
 full_second_order：保留联合变量 $(c,U)$ 的完整计算图，仅用于小规模正确性和代价对照。
 
 其中 coordinate_second_order 会显式截断本地残差相关的交叉二阶路径，避免把查询端的
-stop_gradient(U) 错误解释为自动消除了整个内循环中的交叉依赖。默认仍执行 5 步前向本地
-适应，但只对最后 1 步坐标更新进行二阶反向递推；设 `second_order_steps: null` 可恢复论文
-公式的完整坐标二阶递推。
+stop_gradient(U) 错误解释为自动消除了整个内循环中的交叉依赖。当前主实验默认使用
+`first_order`：服务器仍聚合坐标反馈并用 AdamW 更新 $G_\theta$，只是反馈不再乘内循环 Hessian。
 
 4. 项目结构
 
@@ -324,12 +323,13 @@ method:
   num_basis: 4
   grouping:
     strategy: agglomerative
-    assignment_threshold: 0.95
+    assignment_threshold: 0.90
+    target_num_groups: 5
   inner_loop:
     steps: 5
     coordinate_lr: 0.001
     residual_lr: 0.002
-    meta_gradient: coordinate_second_order
+    meta_gradient: first_order
     second_order_steps: 1
     hessian_damping: 0.0
   server_optimizer:
@@ -353,13 +353,21 @@ method:
 
 主题分类；
 
-文本蕴含；
+二分类文本蕴含；
 
 是否问答；
 
 抽取式问答；
 
-摘要生成。
+摘要生成；
+
+语法可接受性；
+
+释义检测；
+
+问答式蕴含；
+
+三分类多体裁蕴含。
 
 每类任务选择一到两个数据集，每个数据集模拟 2–3 个机构客户端。为了先验证训练链路，prototype.yaml 默认只抽取少量样本；完整实验再通过配置扩大样本数。
 

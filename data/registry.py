@@ -53,10 +53,76 @@ class TaskAdapter(ABC):
         raise NotImplementedError
 
 
+_YES_NO_TASK_TYPES = frozenset(
+    {
+        TaskType.NATURAL_LANGUAGE_INFERENCE,
+        TaskType.BOOLEAN_QA,
+    }
+)
+_YES_NO_OPS = frozenset(
+    {
+        "textual_entailment",
+        "boolean_question_answering",
+        "grammaticality_classification",
+        "sentiment_classification",
+    }
+)
+_YES_NO_VERBALIZER = {
+    "entailment": "yes",
+    "not_entailment": "no",
+    "yes": "yes",
+    "no": "no",
+    "true": "yes",
+    "false": "no",
+    "acceptable": "yes",
+    "unacceptable": "no",
+    "positive": "yes",
+    "negative": "no",
+    "pos": "yes",
+    "neg": "no",
+}
+
+
+def _label_key(text: str) -> str:
+    return text.strip().casefold().replace("-", "_").replace(" ", "_").replace("/", "_")
+
+
+def _yes_no_label(text: str) -> str:
+    return _YES_NO_VERBALIZER.get(_label_key(text), text)
+
+
+_TOPIC_VERBALIZER = {
+    "world": "world",
+    "sports": "sports",
+    "sport": "sports",
+    "business": "business",
+    "sci_tech": "tech",
+    "science_tech": "tech",
+    "tech": "tech",
+    "science": "tech",
+}
+_TOPIC_INSTRUCTION = "Answer with one topic: world, sports, business, or tech."
+
+
+def _verbalize_class_label(text: str) -> str:
+    mapped = _YES_NO_VERBALIZER.get(_label_key(text))
+    if mapped is not None:
+        return mapped
+    mapped = _TOPIC_VERBALIZER.get(_label_key(text))
+    if mapped is not None:
+        return mapped
+    return text
+
+
 class ClassificationAdapter(TaskAdapter):
     def format_input(self, row: Mapping[str, Any], spec: TaskSpec) -> str:
         parts = [f"{name}: {_as_text(_get_required(row, name))}" for name in spec.input_fields]
-        return " | ".join(parts)
+        body = " | ".join(parts)
+        if spec.task_type in _YES_NO_TASK_TYPES or spec.description.op in _YES_NO_OPS:
+            return f"Answer yes or no. {body}"
+        if spec.description.op == "topic_classification":
+            return f"{_TOPIC_INSTRUCTION} {body}"
+        return body
 
     def format_target(
         self,
@@ -66,12 +132,14 @@ class ClassificationAdapter(TaskAdapter):
     ) -> str:
         label = _get_required(row, spec.target_field)
         if isinstance(label, bool) or type(label).__name__ == "bool_":
-            return "yes" if bool(label) else "no"
-        if isinstance(label, int) and label_names is not None:
+            text = "yes" if bool(label) else "no"
+        elif isinstance(label, int) and label_names is not None:
             if label < 0 or label >= len(label_names):
                 raise TaskFormatError(f"label index {label} is outside label_names")
-            return str(label_names[label])
-        return _as_text(label)
+            text = str(label_names[label])
+        else:
+            text = _as_text(label)
+        return _verbalize_class_label(text)
 
     def stratification_key(
         self,

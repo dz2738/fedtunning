@@ -9,6 +9,11 @@ import numpy as np
 import torch
 from torch import Tensor
 
+from baselines.local_prompt import (
+    ClientPromptObjective,
+    PromptOptimizationConfig,
+    optimize_prompt,
+)
 from client.inner_loop import adapt_and_compute_feedback
 from client.state import (
     ClientEvaluationResult,
@@ -84,6 +89,8 @@ class FederatedClient:
         self.data = data
         self.backbone = backbone
         self.text_batch = text_batch
+        self.last_predictions: list[str] = []
+        self.last_golds: list[str] = []
 
     def _tokenize_batches(
         self,
@@ -287,25 +294,7 @@ class FederatedClient:
             mean_support_loss = adaptation.mean_support_loss
             residual_energy = float(adaptation.terminal_residual.float().square().sum())
 
-        predictions: list[str] = []
-        with torch.no_grad():
-            for batch in evaluation_batches:
-                generated = self.backbone.generate(
-                    batch,
-                    prompt_embeddings=final_prompt.detach(),
-                    max_new_tokens=self.text_batch.max_target_length,
-                )
-                predictions.extend(
-                    self.backbone.tokenizer.batch_decode(
-                        generated,
-                        skip_special_tokens=True,
-                    )
-                )
-        metric = compute_task_metric(
-            self.data.task.metric,
-            predictions,
-            [example.target_text for example in evaluation_examples],
-        )
+        metric = self._generate_metric(final_prompt.detach(), evaluation_batches, evaluation_examples)
         return ClientEvaluationResult(
             client_id=self.state.client_id,
             group_id=group_id,
@@ -319,3 +308,131 @@ class FederatedClient:
             metric_name=metric.name,
             metric_value=metric.value,
         )
+
+    def prompt_objective(
+        self,
+        *,
+        config: InnerLoopConfig,
+        seed: int,
+    ) -> ClientPromptObjective:
+        """Build a baseline objective that trains on support and evaluates on query."""
+
+        support_batches = self._tokenize_batches(
+            self.data.support,
+            batch_size=config.support_batch_size,
+            shuffle=True,
+            seed=seed,
+        )
+        query_batches = self._tokenize_batches(
+            self.data.query,
+            batch_size=config.query_batch_size,
+            shuffle=False,
+            seed=seed,
+        )
+
+        def train_loss(prompt: Tensor, step: int) -> Tensor:
+            batch = support_batches[step % len(support_batches)]
+            return self.backbone(batch, prompt_embeddings=prompt).loss
+
+        def eval_loss(prompt: Tensor) -> Tensor:
+            return self._split_loss(prompt, query_batches)
+
+        return ClientPromptObjective(
+            client_id=self.state.client_id,
+            train_loss=train_loss,
+            eval_loss=eval_loss,
+            num_examples=len(self.data.support),
+        )
+
+    def evaluate_prompt(
+        self,
+        prompt: Tensor,
+        *,
+        group_id: str,
+        config: InnerLoopConfig,
+        adaptation_steps: int,
+        seed: int,
+        split: DataSplit = DataSplit.TEST,
+    ) -> ClientEvaluationResult:
+        """Evaluate a concrete prompt, optionally adapting it on the support split."""
+
+        if adaptation_steps < 0:
+            raise ValueError("adaptation_steps must be non-negative")
+        if prompt.ndim != 2:
+            raise ValueError("prompt must have shape [prompt_length, hidden]")
+        working = prompt.detach()
+        mean_support_loss = None
+        if adaptation_steps > 0:
+            objective = self.prompt_objective(config=config, seed=seed)
+            update = optimize_prompt(
+                working,
+                objective,
+                PromptOptimizationConfig(
+                    steps=adaptation_steps,
+                    learning_rate=max(config.coordinate_lr, 1.0e-8),
+                    weight_decay=config.coordinate_weight_decay,
+                ),
+            )
+            working = update.prompt.detach()
+            mean_support_loss = update.mean_train_loss
+        evaluation_examples = self.data.split(split)
+        evaluation_batches = self._tokenize_batches(
+            evaluation_examples,
+            batch_size=config.query_batch_size,
+            shuffle=False,
+            seed=seed,
+        )
+        value = self._split_loss(working, evaluation_batches)
+        metric = self._generate_metric(working, evaluation_batches, evaluation_examples)
+        return ClientEvaluationResult(
+            client_id=self.state.client_id,
+            group_id=group_id,
+            adaptation_steps=adaptation_steps,
+            mean_support_loss=mean_support_loss,
+            test_loss=float(value.detach()),
+            residual_energy=float(working.float().square().sum()),
+            support_examples=len(self.data.support),
+            test_examples=len(evaluation_examples),
+            split=split,
+            metric_name=metric.name,
+            metric_value=metric.value,
+        )
+
+    def _split_loss(self, prompt: Tensor, batches: Sequence[BackboneBatch]) -> Tensor:
+        weighted_losses: list[Tensor] = []
+        total_examples = 0
+        for batch in batches:
+            batch_examples = int(batch.input_ids.shape[0])
+            weighted_losses.append(
+                self.backbone(batch, prompt_embeddings=prompt).loss * batch_examples
+            )
+            total_examples += batch_examples
+        return torch.stack(weighted_losses).sum() / total_examples
+
+    def _generate_metric(
+        self,
+        prompt: Tensor,
+        batches: Sequence[BackboneBatch],
+        evaluation_examples: Sequence[TextExample],
+    ):
+        predictions: list[str] = []
+        max_new_tokens = self.text_batch.max_target_length
+        if self.data.task.metric == "accuracy":
+            max_new_tokens = min(max_new_tokens, 8)
+        with torch.no_grad():
+            for batch in batches:
+                generated = self.backbone.generate(
+                    batch,
+                    prompt_embeddings=prompt,
+                    max_new_tokens=max_new_tokens,
+                )
+                predictions.extend(
+                    self.backbone.tokenizer.batch_decode(
+                        generated,
+                        skip_special_tokens=True,
+                    )
+                )
+        golds = [example.target_text for example in evaluation_examples]
+        self.last_predictions = predictions
+        self.last_golds = golds
+        return compute_task_metric(self.data.task.metric, predictions, golds)

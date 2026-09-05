@@ -1,4 +1,4 @@
-name: prototype_proxy
+name: scale_t6_proxy
 cache_dir: .cache/huggingface
 streaming: false
 offline: false
@@ -104,20 +104,6 @@ tasks:
     in: news_article
     out: free_form_sequence
     dom: news
-    lang: en
-- task_id: glue_cola
-  dataset_path: nyu-mll/glue
-  dataset_name: cola
-  task_type: classification
-  input_fields:
-  - sentence
-  target_field: label
-  metric: accuracy
-  description:
-    op: grammaticality_classification
-    in: sentence
-    out: yes_no_label
-    dom: linguistics
     lang: en
 text_template:
   include_task_prefix: true

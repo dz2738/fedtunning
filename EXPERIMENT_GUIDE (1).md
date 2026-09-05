@@ -21,13 +21,17 @@ backbone，所有客户端在同一 Python 进程中顺序复用该模型。两�
 | 冷启动语义实验 | 已接通 | 当前为任务描述可见的传导式协议 |
 | 经验迁移矩阵 | 已接通 | 使用 Local Prompt 构造两两迁移增益 |
 | 部分消融实验 | 已接通 | 仅运行能够被当前配置严格表达的消融 |
-| 五种基线算法类 | 已实现，未接入统一训练入口 | 暂不能直接生成完整基线对比表 |
+| 五种基线算法 | 已接通 `scripts/run_baseline.py` 与 `scripts/run_e1_baselines.py` | Local / FedAvg / Shared-Local / IFCA / Per-FedAvg 与 FedTaskPrompt 共用同一数据划分与生成指标 |
 | Accuracy、F1、ROUGE 等生成指标 | 已接入 evaluator | validation 与最终 test 均执行生成并按任务汇总 |
+| 论文主对比 E1 | 已接通 | 7 任务原型；分组由 `target_num_groups=5` 锁定；MNLI 已移出（原型学不会三分类） |
+| 少样本 H 曲线 E3-A | 已接通 `scripts/run_e3a_fewshot.py` | 每任务留出一个客户端；描述可见，更新不可见；扫初始化器与 H∈{0,1,3,5,10} |
+| 整任务留出 E3-B | 已接通 `scripts/run_e3b_holdout_task.py` | 训练时不含该任务，评测前按描述准入分组；属于归纳式未见任务协议 |
+| 规模扩展 E2 | 已接通 `scripts/run_e2_scale.py` | 分别扫客户端数（6 任务）与任务数 T∈{3,6,7} |
 | 通信量与运行效率统计 | 统计组件已实现，未接入 simulator 日志 | 当前训练输出不包含完整效率汇总 |
 | basis drift 任务交换 | 只有配置，尚未接入 simulator | 不能用于正式漂移实验结论 |
 
-因此，当前代码可以验证核心优化链路、语义分组、全局生成器更新、冷启动和 loss 级别结果，
-但在基线统一入口和任务生成指标接通前，不应直接据此生成论文最终对比表。
+因此，当前代码可以验证核心优化链路、语义分组、全局生成器更新、冷启动、基线对比和 loss/任务指标结果。
+basis drift 任务交换仍未接入 simulator，不能用于正式漂移实验结论。
 
 ## 2. 环境与硬件要求
 
@@ -121,9 +125,9 @@ configs/experiment/main.yaml
 - backbone：`google/flan-t5-base`；
 - Prompt 长度：20；
 - 共享 basis 数量：4；
-- 语义分组：任务级、顺序无关的凝聚聚类，余弦阈值 0.95；
+- 语义分组：任务级、顺序无关的凝聚聚类，默认目标 4 组，合并下限余弦 0.90；
 - 本地适应步数：5；
-- 元梯度：`coordinate_second_order`，保留最后 1 个坐标二阶反向步；
+- 元梯度：`first_order`（查询损失对共享坐标的一阶梯度；服务器仍用 AdamW 聚合更新 $G_\theta$）；
 - 全局坐标生成器：唯一实例；
 - 本地学习率：坐标 0.001、正交残差 0.002；
 - 服务器学习率：`3e-4`，前 5 轮 warmup，之后按 0.98 衰减；
@@ -170,14 +174,21 @@ uv run pytest -q tests/test_smoke_train.py
 
 ## 6. 准备数据
 
-默认原型包含 6 个任务、每个数据集 2 个客户端（共 12 个客户端）：
+默认原型包含 **7 个异构任务**、每个数据集 2 个客户端（共 14 个客户端）。公共初始化是类型级 \(M=7\)（每类一个 \(P^*\)），\(K=6\)。同一任务的两个客户端使用**相同**任务描述（已去掉 `description_variants`）。
 
 - SST-2 情感分类（Accuracy）
 - AG News 主题分类（Accuracy）
-- GLUE RTE 文本蕴含（Accuracy）
-- BoolQ 是否问答（Accuracy）
+- GLUE RTE 二分类文本蕴含（Accuracy；verbalizer 为 `yes`/`no`）
+- BoolQ 是否问答（Accuracy；verbalizer 为 `yes`/`no`）
 - SQuAD 抽取式问答（Token F1）
 - XSum 摘要（ROUGE-L）
+- GLUE CoLA 语法可接受性（Accuracy）
+
+RTE/BoolQ/SST/CoLA 的输入带 `Answer yes or no.`，金标为 `yes`/`no`。RTE 描述 `out: yes_no_label` 以便与 BoolQ 合组。公共 SVD 用 `raw`、\(K=6\)（7 个奇异值都很接近，\(K=4\) 会切掉 SST/SQuAD）。生成器预训练 2000 步。改 verbalizer、\(K\) 或 SVD 后必须重做 `prepare_public_init.py`。
+
+GLUE MNLI 已移出主混合：冻结 backbone + 20-token prompt 学不会三分类标签（Local Prompt 上界 CE≈5、准确率 0）。QNLI/MRPC 同样因自由文本崩塌已移出。备份见 `artifacts/t8_with_mnli_backup/` 与 `artifacts/t10_qnli_mrpc_backup/`。7 任务 raw SVD 门禁失败跑见 `outputs/e1/fedtaskprompt/seed_42/fedtaskprompt_seed42_20260904_202446`（BoolQ=0、RTE≈15%）。
+
+E2 的 6 任务对照仍用 `scale_t6`（上面的前 6 个）和 `artifacts/public_initialization_t6.pt`，不要和 7 任务主表混在一起。
 
 CoNLL-2003 序列标注已从默认配置中移除。该任务被改写成 `"PER: Alice ; LOC: Paris"` 生成，
 评测再用分号解析做 span micro-F1。金标对金标为 1.0，但自由文本或 `"none"` 预测对实体金标为 0。
@@ -219,7 +230,7 @@ CUDA_VISIBLE_DEVICES=0 uv run python scripts/prepare_data.py \
 如果缓存不完整，该命令会失败，而不会自动从网络补齐。
 若 `huggingface.co` 不可达，下载新数据集时可设置 `HF_ENDPOINT=https://hf-mirror.com`。
 
-### 6.2 准备隔离的公共初始化
+### 6.2 准备隔离的公共初始化：另一份、与客户端不重叠的公共子集离线学出公共 prompt 中心、坐标生成器的初值
 
 公共初始化必须使用 `configs/public_data/prototype_proxy.yaml`。原型配置读取每个数据集
 从第 900 行开始的 128 条样本，而客户端数据只读取前 900 行，因此两者不会共享样本。
@@ -236,7 +247,8 @@ uv run python scripts/prepare_public_init.py \
   data.offline=true \
   public_data.offline=true \
   model.local_files_only=true \
-  method.num_basis=4 \
+  method.num_basis=6 \
+  method.public_initialization.svd_energy=raw \
   method.public_initialization.checkpoint_path=artifacts/public_initialization.pt \
   output_dir="outputs/public_init/seed_42/$RUN_ID"
 ```
@@ -307,8 +319,8 @@ outputs/main/seed_42/<run_id>/
 checkpoint，并且只执行一次最终 test，结果写入 `test_evaluation.json`。每次运行使用时间戳
 `run_id` 创建独立目录；非恢复训练拒绝向已有结果目录追加日志。
 
-`grouping_report.json` 保存任务级余弦相似度矩阵、凝聚聚类阈值、任务分组及其客户端成员。
-聚类只让每个任务参与一次，避免同任务客户端数量影响语义质心。
+`grouping_report.json` 保存任务级余弦相似度矩阵、凝聚聚类阈值、`target_num_groups`、任务分组、客户端成员，以及每个客户端实际使用的描述文案。
+聚类按客户端描述向量进行；同一任务两端共用同一描述。默认先合并到 `target_num_groups` 组，但若最佳簇对余弦低于 0.90 则提前停止。
 
 ## 8. 运行主实验
 
@@ -325,11 +337,9 @@ CUDA_VISIBLE_DEVICES=0 uv run python scripts/train.py \
   deterministic=true \
   data.offline=true \
   model.local_files_only=true \
-  method.num_basis=4 \
-  method.inner_loop.meta_gradient=coordinate_second_order \
+  method.num_basis=6 \
+  method.inner_loop.meta_gradient=first_order \
   method.inner_loop.coordinate_lr=0.001 \
-  method.inner_loop.second_order_steps=1 \
-  method.inner_loop.hessian_damping=0.0 \
   method.public_initialization.enabled=true \
   method.public_initialization.require_checkpoint=true \
   method.public_initialization.checkpoint_path=artifacts/public_initialization.pt \
@@ -341,7 +351,7 @@ CUDA_VISIBLE_DEVICES=0 uv run python scripts/train.py \
   checkpoint.keep_last=2
 ```
 
-正式实验前建议先运行下列 10 轮中等规模验证。它使用 12 个客户端，并在第 10 轮检查
+正式实验前建议先运行下列 10 轮中等规模验证。它使用 14 个客户端（7 任务 × 2），并在第 10 轮检查
 basis 维护：
 
 ```bash
@@ -360,10 +370,9 @@ CUDA_VISIBLE_DEVICES=0 uv run python scripts/train.py \
   data.max_test_examples_per_dataset=0 \
   data.clients_per_dataset=2 \
   data.partition.min_examples_per_client=40 \
-  method.num_basis=4 \
+  method.num_basis=6 \
+  method.inner_loop.meta_gradient=first_order \
   method.inner_loop.coordinate_lr=0.001 \
-  method.inner_loop.second_order_steps=1 \
-  method.inner_loop.hessian_damping=0.0 \
   method.public_initialization.enabled=true \
   method.public_initialization.require_checkpoint=true \
   method.public_initialization.checkpoint_path=artifacts/public_initialization.pt \
@@ -389,7 +398,7 @@ CUDA_VISIBLE_DEVICES=0 uv run python scripts/train.py \
 
 ```bash
 uv run tensorboard \
-  --logdir "outputs/main/seed_42/main_seed42_20260828_010922/tensorboard" \
+  --logdir "outputs/e3a/seed_42/e3a_seed42_20260901_101336/tensorboard" \
   --port 6006 \
   --bind_all
 ```
@@ -405,6 +414,189 @@ uv run tensorboard \
 TensorBoard 的 Smoothing 建议先设为 0。固定 support 曲线的横轴将“轮次 ×
 （本地步数 + 1）”展开；判断单轮微调效果时，比较该轮 step 0 和最后一个点，而不是比较
 `train_batch_loss` 中来自不同 mini-batch 的相邻点。
+
+## 8.2 论文对照实验
+
+按下面顺序跑，不要跳步。所有脚本都接受额外 Hydra 覆盖；不要再包一层 `.sh`。
+
+**分类/NLI/BoolQ 门禁已过（`...003251`）。** 对照仍用同一 public init 与 30 轮、H∈{0,5}。
+MNLI 已移出主混合。门禁：SST / AG / CoLA / RTE / BoolQ 在 H=5 输出 `yes`/`no` 或短话题词，而不是复制输入。诊断用 **30 轮**，评测只看 H=0/H=5。公共 SVD 用 `raw`、\(K=6\)；BoolQ 与 RTE 合组，SST 与 CoLA 合组（`target_num_groups=5`）。AG 金标为 `world`/`sports`/`business`/`tech`。
+
+### 8.2.1 定分组并接通基线
+
+先跑 FedTaskPrompt 一种子，确认 `grouping_report.json` 同任务两端不拆组，且上列门禁通过。AG 短话题词 + `target_num_groups=5` 的 `...003251`：**门禁通过**。H=5：AG 79%、BoolQ 70%、CoLA 50%、RTE 85%、SST 58%、SQuAD F1 86%。
+
+同设置 30 轮对照已完成。Local（`...004636`）SST 96%、CoLA 60%、SQuAD 87%，但 RTE=0、BoolQ 13%。FedAvg（同时刻）RTE 81%、BoolQ 72%、AG 74%，CoLA 仅 31%。FedTaskPrompt 平均 CE 最低（0.54 vs FedAvg 0.60 vs Local 1.50）。
+
+```bash
+HF_HUB_OFFLINE=1 HF_DATASETS_OFFLINE=1 TOKENIZERS_PARALLELISM=false \
+CUDA_VISIBLE_DEVICES=0 uv run python scripts/run_e1_baselines.py \
+  --gpus 0 \
+  --seeds 42 \
+  --methods fedtaskprompt \
+  -- \
+  device=cuda:0 \
+  method.public_initialization.enabled=true \
+  method.public_initialization.require_checkpoint=true \
+  method.public_initialization.checkpoint_path=artifacts/public_initialization.pt \
+  data.offline=true \
+  model.local_files_only=true \
+  deterministic=true
+```
+
+分组正常后再跑第一组对照：Local Prompt（不联邦）和 FedAvg-Prompt（全体一份 prompt）。同一任务两端共用同一描述；分组按客户端描述向量聚类。Hydra 覆盖必须写在 `--` 后面。
+
+```bash
+HF_HUB_OFFLINE=1 HF_DATASETS_OFFLINE=1 TOKENIZERS_PARALLELISM=false \
+CUDA_VISIBLE_DEVICES=0 uv run python scripts/run_e1_baselines.py \
+  --gpus 0 \
+  --seeds 42 \
+  --methods local_prompt fedavg_prompt \
+  -- \
+  device=cuda:0 \
+  method.public_initialization.enabled=true \
+  method.public_initialization.require_checkpoint=true \
+  method.public_initialization.checkpoint_path=artifacts/public_initialization.pt \
+  data.offline=true \
+  model.local_files_only=true \
+  deterministic=true
+```
+
+也可以单独训练一个基线：
+
+```bash
+CUDA_VISIBLE_DEVICES=0 uv run python scripts/run_baseline.py \
+  experiment=e1 \
+  experiment.baseline_method=local_prompt \
+  seed=42 \
+  device=cuda:0
+```
+
+结果目录：`outputs/e1/<method>/seed_<seed>/<run_id>/`。FedTaskPrompt 与基线都写 `test_evaluation.json`。
+
+### 8.2.2 E1 三种子
+
+一种子对比表看起来合理后再扩种子：
+
+```bash
+uv run python scripts/run_e1_baselines.py \
+  --gpus 0 1 2 \
+  --seeds 1 2 3 \
+  --methods local_prompt fedavg_prompt shared_local_prompt ifca_prompt per_fedavg_prompt fedtaskprompt \
+  device=cuda:0 \
+  method.public_initialization.enabled=true \
+  method.public_initialization.require_checkpoint=true \
+  method.public_initialization.checkpoint_path=artifacts/public_initialization.pt \
+  data.offline=true \
+  model.local_files_only=true \
+  deterministic=true
+```
+
+### 8.2.3 E3-A：留出客户端与 H 曲线
+
+协议是传导式：每个任务留出一个客户端，其任务描述参与分组，但数据和更新不进入训练。初始化器为 `zero`、`group_mean`、`nearest_task`、`semantic_generator`、`oracle_group`，适应步数 H∈{0,1,3,5,10}。
+
+```bash
+HF_HUB_OFFLINE=1 HF_DATASETS_OFFLINE=1 TOKENIZERS_PARALLELISM=false \
+CUDA_VISIBLE_DEVICES=0 uv run python scripts/run_e3a_fewshot.py \
+  experiment=e3a \
+  seed=42 \
+  run_id="e3a_seed42_$(date +%Y%m%d_%H%M%S)" \
+  device=cuda:0 \
+  deterministic=true \
+  data.offline=true \
+  model.local_files_only=true \
+  method.public_initialization.enabled=true \
+  method.public_initialization.require_checkpoint=true \
+  method.public_initialization.checkpoint_path=artifacts/public_initialization.pt
+```
+
+输出：`outputs/e3a/seed_42/<run_id>/e3a_fewshot.json`。不要把该协议写成未见任务描述的归纳冷启动。
+
+### 8.2.4 E3-B：整任务留出
+
+训练时去掉某个任务的全部客户端，训练后再用该任务描述准入已有组或新建组。这才是归纳式未见任务协议。默认留出 `glue_rte`；换任务时覆盖 `experiment.holdout.task_id`。
+
+```bash
+HF_HUB_OFFLINE=1 HF_DATASETS_OFFLINE=1 TOKENIZERS_PARALLELISM=false \
+CUDA_VISIBLE_DEVICES=0 uv run python scripts/run_e3b_holdout_task.py \
+  experiment=e3b \
+  experiment.holdout.task_id=glue_rte \
+  seed=42 \
+  run_id="e3b_rte_seed42_$(date +%Y%m%d_%H%M%S)" \
+  device=cuda:0 \
+  deterministic=true \
+  data.offline=true \
+  model.local_files_only=true \
+  method.public_initialization.enabled=true \
+  method.public_initialization.require_checkpoint=true \
+  method.public_initialization.checkpoint_path=artifacts/public_initialization.pt
+```
+
+输出：`outputs/e3b/seed_42/<run_id>/e3b_holdout_task.json`。
+
+### 8.2.5 E2：任务数与客户端数
+
+两个轴分开扫，不要同时改 T 和每任务客户端数。脚本会按 T 绑定数据、分组数和公共 checkpoint：T=3 → `_t3.pt`（\(K=3\)），T=6 → `_t6.pt`（\(K=4\)），T=7 → `public_initialization.pt`（\(K=4\)）。不要在 overrides 里再写死 `checkpoint_path`，否则会盖掉按 T 绑定的路径。
+
+```bash
+HF_ENDPOINT=https://hf-mirror.com CUDA_VISIBLE_DEVICES=0 \
+uv run python scripts/prepare_data.py data=prototype seed=42
+
+RUN_ID="public_init_t7_$(date +%Y%m%d_%H%M%S)"
+HF_HUB_OFFLINE=1 HF_DATASETS_OFFLINE=1 TOKENIZERS_PARALLELISM=false \
+CUDA_VISIBLE_DEVICES=0 uv run python scripts/prepare_public_init.py \
+  public_data=prototype_proxy \
+  seed=42 \
+  run_id="$RUN_ID" \
+  device=cuda:0 \
+  data.offline=true \
+  public_data.offline=true \
+  model.local_files_only=true \
+  method.num_basis=6 \
+  method.public_initialization.instances_per_task=1 \
+  method.public_initialization.svd_energy=raw \
+  method.public_initialization.checkpoint_path=artifacts/public_initialization.pt \
+  output_dir="outputs/public_init/seed_42/$RUN_ID"
+```
+
+只扫客户端数（T=6，每任务客户端数 ∈{2,4,8}）：
+
+```bash
+HF_HUB_OFFLINE=1 HF_DATASETS_OFFLINE=1 TOKENIZERS_PARALLELISM=false \
+uv run python scripts/run_e2_scale.py \
+  --gpus 0 \
+  --seeds 42 \
+  --sweep clients \
+  --client-counts 2 4 6 8 \
+  -- \
+  device=cuda:0 \
+  method.public_initialization.enabled=true \
+  method.public_initialization.require_checkpoint=true \
+  data.offline=true \
+  model.local_files_only=true \
+  deterministic=true
+```
+
+只扫任务数（每任务 2 客户端，T∈{3,6,7}）：
+
+```bash
+HF_HUB_OFFLINE=1 HF_DATASETS_OFFLINE=1 TOKENIZERS_PARALLELISM=false \
+uv run python scripts/run_e2_scale.py \
+  --gpus 0 \
+  --seeds 42 \
+  --sweep tasks \
+  --task-counts 3 6 7 \
+  -- \
+  device=cuda:0 \
+  method.public_initialization.enabled=true \
+  method.public_initialization.require_checkpoint=true \
+  data.offline=true \
+  model.local_files_only=true \
+  deterministic=true
+```
+
+`scale_t9` 仍保留，但不作为默认 E2 轴；已有 T=9 结果作为旧协议归档。
 
 ## 9. 从 checkpoint 恢复训练
 
@@ -488,8 +680,7 @@ CUDA_VISIBLE_DEVICES=0 uv run python scripts/run_cold_start.py \
 outputs/cold_start/seed_42/cold_start.json
 ```
 
-该实现属于任务描述可见的传导式语义冷启动。论文中应明确说明，不能将它描述为任务描述也不可见的
-完全归纳式冷启动。
+论文主实验请改用 `scripts/run_e3a_fewshot.py`（多初始化器 × H 曲线）。本脚本仍保留单一 `semantic_generator` 路径，便于对照旧结果。
 
 ## 12. 构造经验迁移矩阵
 
@@ -688,8 +879,9 @@ model.dtype=float32
 
 ### 17.5 完整二阶模式速度很慢或显存很高
 
-这是预期现象。`full_second_order` 只应用于小规模正确性与代价对照。主实验优先使用
-`coordinate_second_order`，资源紧张时使用 `first_order`。
+这是预期现象。`full_second_order` 只应用于小规模正确性与代价对照。当前主实验默认
+`first_order`。若要回到论文的坐标 Hessian 路径，覆盖
+`method.inner_loop.meta_gradient=coordinate_second_order`。
 
 `coordinate_second_order` 默认保留 5 步前向本地适应，但只反向传播最后 1 个
 坐标 Hessian 步，以避开更早步骤观测到的强负曲率放大。以下完整命令可复现关键候选扫描：
@@ -717,7 +909,7 @@ do
     data.max_test_examples_per_dataset=0 \
     data.clients_per_dataset=1 \
     data.partition.min_examples_per_client=4 \
-    method.num_basis=4 \
+    method.num_basis=6 \
     method.inner_loop.steps=5 \
     method.inner_loop.coordinate_lr="$COORDINATE_LR" \
     method.inner_loop.second_order_steps="$SECOND_ORDER_STEPS" \
@@ -759,14 +951,14 @@ Tikhonov 阻尼 100/1000 均未优于低学习率加 1 步截断，因此默认�
 2. uv run pytest -q
 3. prepare_data.py
 4. 两轮小数据真实模型试跑
-5. 单 seed 主实验
-6. checkpoint 独立评测
-7. 冷启动实验
-8. 迁移矩阵实验
-9. 当前支持的消融实验
-10. 两到三张 GPU 并行运行多个 seed
-11. 汇总均值、标准差、尾部性能、负迁移和效率
-12. 接通统一基线 runner 与生成指标后，再制作论文最终对比表
+5. 确认 grouping_report 为 3–4 组
+6. E1 一种子：FedTaskPrompt + 全部基线
+7. E1 三种子
+8. E3-A 留出客户端 H 曲线
+9. E3-B 整任务留出
+10. E2 分别扫客户端数与任务数
+11. checkpoint 独立评测、迁移矩阵、当前支持的消融
+12. 汇总均值、标准差、尾部性能和任务原始指标
 ```
 
 只有在前一步的输出、数值范围和资源占用均正常后，才应扩大数据规模、训练轮数和随机种子数量。

@@ -8,34 +8,19 @@ from dataclasses import asdict
 from pathlib import Path
 
 import hydra
-import numpy as np
 from omegaconf import DictConfig
 
 from data.schema import DataSplit
+from trainer.holdout import select_one_client_per_task
 from trainer.simulator import FederatedSimulator, SimulationConfig
 
 try:
-    from scripts.train import ExperimentRuntime, build_runtime
+    from train import build_runtime
 except ImportError:
-    from train import ExperimentRuntime, build_runtime
+    from scripts.train import build_runtime
 
 
 LOGGER = logging.getLogger(__name__)
-
-
-def select_holdout_clients(
-    runtime: ExperimentRuntime,
-    *,
-    seed: int,
-) -> tuple[str, ...]:
-    rng = np.random.default_rng(seed)
-    by_task: dict[str, list[str]] = {}
-    for client_id, client in runtime.clients.items():
-        by_task.setdefault(client.state.task_id, []).append(client_id)
-    return tuple(
-        sorted(str(rng.choice(sorted(client_ids))))
-        for _, client_ids in sorted(by_task.items())
-    )
 
 
 @hydra.main(version_base="1.3", config_path="../configs", config_name="config")
@@ -44,7 +29,7 @@ def main(config: DictConfig) -> None:
     runtime = build_runtime(config)
     if not bool(config.experiment.holdout.expose_task_description):
         raise ValueError("current semantic cold-start protocol requires task descriptions")
-    holdout_ids = select_holdout_clients(runtime, seed=int(config.seed))
+    holdout_ids = select_one_client_per_task(runtime.clients, seed=int(config.seed))
     training_clients = {
         client_id: client
         for client_id, client in runtime.clients.items()

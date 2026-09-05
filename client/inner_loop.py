@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Callable
 from dataclasses import dataclass
 
@@ -17,6 +18,7 @@ from model.prompt_subspace import PromptSubspace
 
 SupportLoss = Callable[[Tensor, int], Tensor]
 QueryLoss = Callable[[Tensor], Tensor]
+LOGGER = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -33,6 +35,13 @@ class AdaptationResult:
     @property
     def mean_support_loss(self) -> float:
         return sum(self.support_losses) / len(self.support_losses)
+
+
+def _finite_or_zero(name: str, tensor: Tensor) -> Tensor:
+    if tensor is None or not torch.isfinite(tensor).all():
+        LOGGER.warning("non-finite %s; skipping that update", name)
+        return torch.zeros_like(tensor)
+    return tensor
 
 
 def _scalar_loss(name: str, loss: Tensor) -> Tensor:
@@ -72,7 +81,12 @@ def _monitor_support_loss(
         return None
     with torch.no_grad():
         prompt = subspace(coordinates.detach(), residual.detach())
-        loss = _scalar_loss("support_monitor_loss", monitor_loss(prompt))
+        loss = monitor_loss(prompt)
+        if loss.ndim != 0:
+            raise ValueError("support_monitor_loss must return a scalar tensor")
+        if not torch.isfinite(loss):
+            LOGGER.warning("non-finite support_monitor_loss; recording nan")
+            return float("nan")
     return float(loss)
 
 
@@ -154,6 +168,8 @@ def _detached_adaptation(
                 create_graph=False,
             )
         )
+        coordinate_grad = _finite_or_zero("support coordinate gradient", coordinate_grad)
+        residual_grad = _finite_or_zero("support residual gradient", residual_grad)
 
         coordinates = (
             coordinates
@@ -218,6 +234,11 @@ def _query_coordinate_gradient(
     prompt = subspace(coordinates, residual.detach())
     loss = _scalar_loss("query_loss", query_loss(prompt))
     gradient = torch.autograd.grad(loss, coordinates)[0]
+    if gradient is None or not torch.isfinite(gradient).all():
+        LOGGER.warning(
+            "non-finite query coordinate gradient; contributing zeros this round"
+        )
+        gradient = torch.zeros_like(coordinates)
     return loss, gradient
 
 

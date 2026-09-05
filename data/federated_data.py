@@ -23,6 +23,7 @@ from data.registry import TaskAdapterRegistry, build_default_registry
 from data.schema import (
     ClientPartition,
     DataSplit,
+    TaskDescription,
     TaskSpec,
     TextExample,
     validate_unique_task_ids,
@@ -145,6 +146,7 @@ class ClientData:
     task: TaskSpec
     partition: ClientPartition
     examples: Sequence[TextExample]
+    description: TaskDescription
 
     def split(self, split: DataSplit | str) -> ClientDatasetView:
         return ClientDatasetView(self.examples, self.partition.indices(split))
@@ -311,12 +313,13 @@ def build_federated_data(
             seed=task_seed + 1_000,
         )
         tasks[spec.task_id] = spec
-        for client_partition in client_partitions:
+        for client_index, client_partition in enumerate(client_partitions):
             clients[client_partition.client_id] = ClientData(
                 client_id=client_partition.client_id,
                 task=spec,
                 partition=client_partition,
                 examples=examples,
+                description=spec.client_description(client_index),
             )
 
     return FederatedData(tasks=tasks, clients=clients)
